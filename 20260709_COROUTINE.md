@@ -61,10 +61,11 @@ it also hard for reviewers because of the cognitive load of tracking the "safe"
 callbacks and the "dangerous" ones.
 
 # Functional programming of HTTP filters
+To implement a filter that buffers and parses a bunch of data before it decides
+to forward headers to the next filters, we write something like
+[this](https://github.com/envoyproxy/envoy/blob/main/source/extensions/filters/http/ai_protocol_manager/filter.cc).
 
-Wouldn't it be nice if we can write an HTTP filter in the following way, to
-implement a filter that buffers and parses a bunch of data before it decides to
-forward headers to the next filters?
+Wouldn't it be nice if we can write the following code instead?
 
 ```c++
 enum class DecoderResult {
