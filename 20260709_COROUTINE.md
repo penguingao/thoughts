@@ -86,23 +86,25 @@ HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
   DataParser parser;
   for co_await(InstancePtr data : data_generator) {
     if (absl::Status status = coawait parser.feed(data); !status.ok()) {
-      co_return kReset;
+      co_return DecodeResult::kReset;
     }
-    if (!parser.hasEnoughData()) {
-      continue;
+    if (parser.hasEnoughData()) {
+      break;
     }
-    if (auto [status, forward_data] = forward_headers(std::move(header_action_token)); !status.ok()) {
-      co_return kReset;
-    }
-    for co_await(InstancePtr data : parser.bufferedData()) {
-        if (auto [status, forward_trailer] = co_await forward_data(parser.bufferedData()); !status.ok()) {
-             co_return kReset;
-        }
-    }
-    // we don't care about trailers any more, so they just pass through
-    co_return kSuccess;
   }
-  co_return kSuccess;
+  if (!parser.hasEnoughData()) {
+    return DecodeResult::kReset;
+  }
+  if (auto [status, forward_data] = forward_headers(std::move(header_action_token)); !status.ok()) {
+    co_return DecodeResult::kReset;
+  }
+  for co_await(InstancePtr data : parser.bufferedData()) {
+    if (auto [status, forward_trailer] = co_await forward_data(parser.bufferedData()); !status.ok()) {
+      co_return DecodeResult::kReset;
+    }
+  }
+  // we don't care about future data and trailers (if any), so they just pass through
+  co_return DecodeResult::kSuccess;
 }
 ```
 
@@ -111,13 +113,12 @@ We can also imagine simple filters really just read the headers and `co_return`:
 ```c++
 HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
   auto [header_status, headers, header_action_token, data_generator] = co_await get_headers();
-
   // do things with headers
 
   if (auto [status, forward_data] = forward_headers(std::move(header_action_token)); !status.ok()) {
-    co_return kReset;
+    co_return DecodeResult::kReset;
   }
-  co_return kSuccess;
+  co_return DecodeResult::kSuccess;
 }
 ```
 
