@@ -109,6 +109,9 @@ We can also imagine simple filters really just read the headers and `co_return`:
 ```c++
 HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
   auto [header_status, headers, header_action_token, data_generator] = co_await get_headers();
+
+  // do things with headers
+
   if (auto [status, forward_data] = forward_headers(std::move(header_action_token)); !status.ok()) {
     co_return kReset;
   }
@@ -120,6 +123,7 @@ We can define a similar coroutine on response path and `HttpEncoder
 encode(...)`.
 
 This way of writing a filter has a few nice properties:
+
 - it's explicit that headers processing is before data, which is before trailers
 - it's a compile time error to forward header twice
 - it gives the filter the control over how much to buffer per stream
@@ -131,9 +135,15 @@ Obviously, we need access to streamInfo, configuration, route table, and so on.
 These functionality should be provided as synchronous function call, and they
 should not suffer re-entrce problem.
 
-The API needs some further fine tune to provide those functionalities, plus the
-support of timeout. We can make each of the `co_await` calls take a timeout.
+We also need async functionalities like local reply, state sharing between
+decode and encode path.
 
-When the filter needs to wait for other async events like reading a file, or
-making an RPC to another service, it implements coroutine and `co_await` on
-them.
+Furthermore the API needs some other fine tuning
+to provide those functionalities, plus the support of timeout. We can make each
+of the `co_await` calls take a timeout.
+
+But hopefully, it gives a rough idea on how things would look like.
+
+# More Details
+
+
