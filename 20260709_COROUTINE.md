@@ -1,66 +1,66 @@
 # C++20 coroutine support
 
-C++20 introduced compiler primitives to use
-[coroutine](https://en.cppreference.com/cpp/language/coroutines). Coroutine
-looks like functions, but they do not reside on the stack.
+C++20 introduced compiler primitives to support
+[coroutines](https://en.cppreference.com/cpp/language/coroutines). Coroutines
+look like functions, but they do not reside on the stack.
 
 If a function contains `co_await`, `co_yield` or `co_return`, it is a coroutine.
 
-One of the reasons to write asynchronous code in C++ is to deal with external
-events, typically I/O, because blocking I/O would otherwise require dedicated
-thread for each logical sequence operations.
+One of the main reasons to write asynchronous code in C++ is to handle external
+events, typically I/O, because blocking I/O would otherwise require a dedicated
+thread for each logical sequence of operations.
 
-In the case of network proxies like Envoy, or networking protocol code like
-QUICHE, the predominant paradigm is event driven programming, which natually
-comes with a lot of callbacks.
+In network proxies like Envoy, or networking protocol code like
+QUICHE, the predominant paradigm is event-driven programming, which naturally
+comes with many callbacks.
 
-While being performant, it comes with the inevitable "callback hell" as the
-software grows in complexity. Callbacks are hard to understand for a few
+While performant, this approach inevitably leads to "callback hell" as the
+software grows in complexity. Callbacks are difficult to understand for several
 reasons:
 
--   it fragments a sequence of events into many functions, making it harder to
-    trace and get the full picture
--   it makes debugging hard because the call stack doesn't natually carry the
-    "why" of a event - we only know "how" a callback is delivered, but by the
-    time the callback is delivered, it's usually hard to know what's the
-    sequence of events that lead to this callback
--   it is prone re-entrance bugs. While it is often the case that an entire
-    sequence is handled on a single thread, each time a function is called
-    carries the risk of that funciton eventually re-enters the the orginating
-    class. At the point of re-entering, the state of the class might be
-    inconsisent. After returning from the function call, the internal state
-    might also have changed
--   object life cycle management. When an object registers a callback to another
-    object, if the orginating object needs to be destructed, it needs to cancel
-    the callback. This is usually documented in the contract between the
-    objects, but hard to test or enforce
+-   They fragment a sequence of events into many functions, making it harder to
+    trace and see the big picture.
+-   They make debugging difficult because the call stack doesn't naturally carry the
+    "why" of an event. We only know "how" a callback is delivered, but by the
+    time it is delivered, it is usually hard to know what
+    sequence of events led to it.
+-   They are prone to re-entrancy bugs. While an entire
+    sequence is often handled on a single thread, calling a function
+    carries the risk that the function eventually re-enters the originating
+    class. At the point of re-entry, the state of the class might be
+    inconsistent. After returning from the function call, the internal state
+    might also have changed.
+-   Object lifecycle management is complex. When an object registers a callback with another
+    object, it must cancel the callback if it is destructed.
+    This is usually documented in the contract between the
+    objects, but it is hard to test or enforce.
 
-Coroutine makes it possible to write blocking I/O style procedures. It gets
-around the callback hell if used properly:
+Coroutines make it possible to write blocking I/O style procedures. They avoid
+callback hell if used properly:
 
--   the code is more streamlined
--   each time a coroutine is created, and awaited upon, the caller's "handler"
-    is given to the coroutine, making it possible to trace back the originator
-    of the call
--   it makes it easier to just use function local variables to keep track of
-    state between async events, so that there is less re-entrance bug - even if
-    the same function is called again, the variables are all local to a new
-    instance of the coroutine
--   all the local variables are deleted only when all the coroutines it calls
-    return, so they are safe and easier to deallocate
+-   The code is more streamlined.
+-   Each time a coroutine is created and awaited, the caller's handler
+    is given to the coroutine, making it possible to trace back to the originator
+    of the call.
+-   It allows the use of function-local variables to keep track of
+    state between async events, which reduces re-entrancy bugs. Even if
+    the same function is called again, the variables are local to a new
+    instance of the coroutine.
+-   Local variables are destroyed only when the coroutine finishes,
+    making resource management safer and easier.
 
 # Envoy's HTTP filters
 
-Envoy's HTTP filters make Envoy's functionalities modular and composable.
-Overtime, a lot of callbacks and functionalities have been added to it. Each
-HTTP filter might have a few life cycle callbacks, plus a few HTTP event
+Envoy's HTTP filters make Envoy's functionality modular and composable.
+Over time, many callbacks and features have been added. Each
+HTTP filter might have several lifecycle callbacks, plus a few HTTP event
 callbacks. The interfaces have grown
 [big enough](https://source.corp.google.com/piper///depot/google3/third_party/envoy/src/envoy/http/filter.h;rcl=945155946;l=1)
-that it makes it not very friendly to new developers to contribute, while making
-it also hard for reviewers because of the cognitive load of tracking the "safe"
-callbacks and the "dangerous" ones.
+that they are not very friendly to new contributors, while also
+increasing the cognitive load for reviewers who must track "safe"
+versus "dangerous" callbacks.
 
-# Functional programming of HTTP filters
+# Sequential HTTP Filters with Coroutines
 To implement a filter that buffers and parses a bunch of data before it decides
 to forward headers to the next filters, we write something like
 [this](https://github.com/envoyproxy/envoy/blob/main/source/extensions/filters/http/ai_protocol_manager/filter.cc).
@@ -68,13 +68,13 @@ to forward headers to the next filters, we write something like
 Wouldn't it be nice if we can write the following code instead?
 
 ```c++
-enum class DecoderResult {
+enum class DecodeResult {
   // the filter has done its job. any further header, body, trailer events skip
   // this filter.
   kSuccess,
   // the filter wants to reset and fail the stream.
   kReset,
-  // similar to the current recreateStream callbac, it restarts the filter
+  // similar to the current recreateStream callback, it restarts the filter
   // chain.
   kRecreateStream,
 };
@@ -85,8 +85,8 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers) {
   auto [header_status, headers, header_action_token, data_generator] = co_await get_headers();
 
   DataParser parser;
-  for co_await(InstancePtr data : data_generator) {
-    if (absl::Status status = coawait parser.feed(data); !status.ok()) {
+  for co_await (InstancePtr data : data_generator) {
+    if (absl::Status status = co_await parser.feed(data); !status.ok()) {
       co_return DecodeResult::kReset;
     }
     if (parser.hasEnoughData()) {
@@ -94,14 +94,14 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers) {
     }
   }
   if (!parser.hasEnoughData()) {
-    return DecodeResult::kReset;
+    co_return DecodeResult::kReset;
   }
   auto [status, forward_data] = forward_headers(std::move(header_action_token));
   if (!status.ok()) {
     co_return DecodeResult::kReset;
   }
-  for co_await(InstancePtr data : parser.bufferedData()) {
-    if (absl::Status status = co_await forward_data(parser.bufferedData()); !status.ok()) {
+  for co_await (InstancePtr data : parser.bufferedData()) {
+    if (absl::Status status = co_await forward_data(data); !status.ok()) {
       co_return DecodeResult::kReset;
     }
   }
@@ -113,7 +113,7 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers) {
 We can also imagine simple filters really just read the headers and `co_return`:
 
 ```c++
-HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
+HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers) {
   auto [header_status, headers, header_action_token, data_generator] = co_await get_headers();
   // do things with headers
 
@@ -124,30 +124,29 @@ HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
 }
 ```
 
-We can define a similar coroutine on response path and `HttpEncoder
+We can define a similar coroutine on the response path: `HttpEncoder
 encode(...)`.
 
-This way of writing a filter has a few nice properties:
+Writing filters this way has several advantages:
 
-- it's explicit that headers processing is before data, which is before trailers
-- it's a compile time error to forward header twice
-- it gives the filter the control over how much to buffer per stream
-- the filter can also freely inject data
-- it does not suffer reentrance and life cycle problems. states are local to
-  this coroutine and they are safe to free as soon as `co_return` happens.
+- It makes it explicit that header processing occurs before data, which occurs before trailers.
+- It is a compile-time error to forward headers twice.
+- It gives the filter control over how much to buffer per stream.
+- The filter can freely inject data.
+- It does not suffer from re-entrancy and lifecycle problems. State is local to
+  this coroutine and is safely freed as soon as `co_return` occurs.
 
-Obviously, we need access to streamInfo, configuration, route table, and so on.
-These functionality should be provided as synchronous function call, and they
-should not suffer re-entrce problem.
+Obviously, we need access to `StreamInfo`, configuration, route tables, etc.
+These functionalities should be provided via synchronous function calls that do
+not suffer from re-entrancy issues.
 
-We also need async functionalities like local reply, state sharing between
-decode and encode path.
+We also need asynchronous functionality like local replies and state sharing between
+the decode and encode paths.
 
-Furthermore the API needs some other fine tuning
-to provide those functionalities, plus the support of timeout. We can make each
-of the `co_await` calls take a timeout.
+Furthermore, the API needs refinement to support these features,
+along with timeout support. We could allow each `co_await` call to accept a timeout.
 
-But hopefully, it gives a rough idea on how things would look like.
+But hopefully, this gives a rough idea of how things would look.
 
 # More Details
 
