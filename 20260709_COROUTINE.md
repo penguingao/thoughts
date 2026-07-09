@@ -63,7 +63,7 @@ callbacks and the "dangerous" ones.
 # Functional programming of HTTP filters
 
 Wouldn't it be nice if we can write an HTTP filter in the following way, to
-implement a buffer that buffers and parses a bunch of data before it decides to
+implement a filter that buffers and parses a bunch of data before it decides to
 forward headers to the next filters?
 
 ```c++
@@ -85,7 +85,7 @@ HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
 
   DataParser parser;
   for co_await(InstancePtr data : data_generator) {
-    if (absl::Status status = parser.feed(data); !status.ok()) {
+    if (absl::Status status = coawait parser.feed(data); !status.ok()) {
       co_return kReset;
     }
     if (!parser.hasEnoughData()) {
@@ -94,8 +94,10 @@ HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
     if (auto [status, forward_data] = forward_headers(std::move(header_action_token)); !status.ok()) {
       co_return kReset;
     }
-    if (auto [status, forward_trailer] = co_await forward_data(parser.bufferedData()); !status.ok()) {
-      co_return kReset;
+    for co_await(InstancePtr data : parser.bufferedData()) {
+        if (auto [status, forward_trailer] = co_await forward_data(parser.bufferedData()); !status.ok()) {
+             co_return kReset;
+        }
     }
     // we don't care about trailers any more, so they just pass through
     co_return kSuccess;
@@ -145,5 +147,4 @@ of the `co_await` calls take a timeout.
 But hopefully, it gives a rough idea on how things would look like.
 
 # More Details
-
 
