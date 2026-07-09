@@ -95,11 +95,12 @@ HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
   if (!parser.hasEnoughData()) {
     return DecodeResult::kReset;
   }
-  if (auto [status, forward_data] = forward_headers(std::move(header_action_token)); !status.ok()) {
+  auto [status, forward_data] = forward_headers(std::move(header_action_token));
+  if (!status.ok()) {
     co_return DecodeResult::kReset;
   }
   for co_await(InstancePtr data : parser.bufferedData()) {
-    if (auto [status, forward_trailer] = co_await forward_data(parser.bufferedData()); !status.ok()) {
+    if (absl::Status status = co_await forward_data(parser.bufferedData()); !status.ok()) {
       co_return DecodeResult::kReset;
     }
   }
