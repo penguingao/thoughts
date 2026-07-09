@@ -106,7 +106,7 @@ HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
 
 We can also imagine simple filters really just read the headers and `co_return`:
 
-```
+```c++
 HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
   auto [header_status, headers, header_action_token, data_generator] = co_await get_headers();
   if (auto [status, forward_data] = forward_headers(std::move(header_action_token)); !status.ok()) {
