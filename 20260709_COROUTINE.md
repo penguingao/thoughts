@@ -77,7 +77,7 @@ enum class DecoderResult {
   // chain.
   kRecreateStream,
 };
-HttpDecoder decode(HeaderGetter get_headers, ForwardHeaders forward_headers) {
+HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers) {
   // status: to signal stream reset or any other failures of the request
   // headers: a shared_ptr of the header map
   // header_action_token: can only be used once during forward_headers
