@@ -59,7 +59,7 @@ Envoy's HTTP filters make Envoy's functionality modular and composable. Over
 time, many callbacks and features have been added. Each HTTP filter might have
 several lifecycle callbacks, plus a few HTTP event callbacks. The interfaces
 have grown
-[big enough](https://source.corp.google.com/piper///depot/google3/third_party/envoy/src/envoy/http/filter.h;rcl=945155946;l=1)
+[big enough](https://github.com/envoyproxy/envoy/blob/main/envoy/http/filter.h)
 that they are not very friendly to new contributors, while also increasing the
 cognitive load for reviewers who must track "safe" versus "dangerous" callbacks.
 
@@ -76,21 +76,16 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
                    LocalReplier reply_locally) {
   absl::StatusOr<RequestHeaders> headers;
   DataGenerator data_generator;
-
-  std::tie(headers, data_generator) = co_await std::move(get_headers)();
-  if (headers.ok()) {
-    std::move(reply_locally)(Http::Code::InternalServerError);
-    co_return DecodeResult::kTerminate;
-  }
+  ASSIGN_OR_CO_RETURN(
+    std::tie(headers, data_generator), co_await std::move(get_headers)(), DecodeResult::kReset);
 
   // Some custom logic.
   DataParser parser;
   while (!parser.hasEnoughData() && !data_generator.end_stream()) {
-    absl::StaturOr<Buffer::InstancePtr> data = co_await data_generator.next();
-    if (!data.ok()) {
-      std::move(reply_locally)(Http::Code::InternalServerError);
-      co_return DecodeResult::kTerminate;
-    }
+    ASSIGN_OR_CO_RETURN(
+      absl::StaturOr<Buffer::InstancePtr> data, co_await data_generator.next(),
+      DecodeResult::kReset);
+
     if (absl::Status status = co_await parser.feed(*std::move(data)); !status.ok()) {
       std::move(reply_locally)(Http::Code::BadRequest);
       co_return DecodeResult::kTerminate;
@@ -104,16 +99,14 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
   absl::Status status;
   DataForwarder forward_data;
 
-  std::tie(status, forward_data) = std::move(forward_headers)(*std::move(headers);
-  if (!status.ok()) {
-    co_return DecodeResult::kReset;
-  }
+  ASSIGN_OR_CO_RETURN(
+    std::tie(status, forward_data), std::move(forward_headers)(*std::move(headers)),
+    DecodeResult::kReset);
 
   absl::StatusOr<Buffer::InstancePtr> buffered_data = parser.bufferedData();
   while (buffered_data.ok() && *buffered_data != nullptr) {
-    if (absl::Status status = co_await forward_data(*std::move(buffered_data)); !status.ok()) {
-      co_return DecodeResult::kReset;
-    }
+    CO_RETURN_IF_ERROR(
+      co_await forward_data(*std::move(buffered_data)), DecodeResult::kReset);
   }
 
   co_return DecodeResult::kSuccess;
@@ -125,15 +118,14 @@ We can also imagine simple filters really just read the headers and `co_return`:
 ```c++
 HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
                    LocalReplier reply_locally) {
-  absl::Status status;
-  std::unique_ptr<RequestHeaders> headers;
-  DataGenerator data_generator;
-  std::tie(status, headers, data_generator) = co_await std::move(get_headers)();
+  absl::StatusOr<RequestHeaders> headers;
+  ASSIGN_OR_CO_RETURN(
+    std::tie(headers, std::ignore), co_await std::move(get_headers)(), DecodeResult::kReset);
+
   // do things with headers
 
-  if (auto [status, forward_data] = forward_headers(std::move(header_action_token)); !status.ok()) {
-    co_return DecodeResult::kReset;
-  }
+  ASSIGN_OR_CO_RETURN(
+    auto [status, _], std::move(forward_headers)(*std::move(headers)), DecodeResult::kReset);
   co_return DecodeResult::kSuccess;
 }
 ```
