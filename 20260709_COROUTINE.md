@@ -72,7 +72,6 @@ to forward headers to the next filters, we write something like
 Wouldn't it be nice if we can write the following code instead?
 
 ```c++
-// the filter code's cc file.
 HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
                    LocalReplier reply_locally) {
   absl::StatusOr<RequestHeaders> headers;
