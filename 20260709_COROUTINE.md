@@ -118,14 +118,13 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
   // Some custom logic.
   DataParser parser;
   while (!parser.hasEnoughData() && !data_generator.end_stream()) {
-    Buffer::InstancePtr data;
-    std::tie(status, data) = std::move(co_await data_generator.next());
-    if (!status.ok()) {
+    absl::StaturOr<Buffer::InstancePtr> data = std::move(co_await data_generator.next());
+    if (!data.ok()) {
       std::move(reply_locally)(Http::Code::InternalServerError);
       co_return DecodeResult::kTerminate;
     }
     // The custom logic itself can be coroutine and async.
-    if (absl::Status status = co_await parser.feed(std::move(data)); !status.ok()) {
+    if (absl::Status status = co_await parser.feed(*std::move(data)); !status.ok()) {
       std::move(reply_locally)(Http::Code::BadRequest);
       co_return DecodeResult::kTerminate;
     }
