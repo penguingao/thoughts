@@ -2,15 +2,19 @@
 
 C++20 introduced compiler primitives to support
 [coroutines](https://en.cppreference.com/cpp/language/coroutines). Coroutines
-look like functions, but they do not reside on the stack.
+look like functions, but they do not reside on the stack. It allows wrting
+asynchronous code as sequential-looking functions, making it eader to reason
+about.
 
 If a function contains `co_await`, `co_yield` or `co_return`, it is a coroutine.
+
+# The callback hell
 
 One of the main reasons to write asynchronous code in C++ is to handle external
 events, typically I/O, because blocking I/O would otherwise require a dedicated
 thread for each logical sequence of operations.
 
-In network proxies like Envoy, or networking protocol code like
+In network proxies like Envoy, or networking protocol libraries like
 QUICHE, the predominant paradigm is event-driven programming, which naturally
 comes with many callbacks.
 
@@ -18,11 +22,13 @@ While performant, this approach inevitably leads to "callback hell" as the
 software grows in complexity. Callbacks are difficult to understand for several
 reasons:
 
--   They fragment a sequence of events into many functions, making it harder to
-    trace and see the big picture.
--   They make debugging difficult because the call stack doesn't naturally carry the
-    "why" of an event. We only know "how" a callback is delivered, but by the
-    time it is delivered, it is usually hard to know what
+-   They fragment a sequence of event handling logic into many functions, making
+    it harder to trace and see the big picture.
+-   This naturally requires a lot of states stored in objects for functions to
+    understand the context.
+-   The many callbacks make debugging difficult because the call stack doesn't
+    naturally carry the "why" of an event. We only know "how" a callback is
+    delivered, but by the time it is delivered, it is usually hard to know what
     sequence of events led to it.
 -   They are prone to re-entrancy bugs. While an entire
     sequence is often handled on a single thread, calling a function
@@ -30,13 +36,13 @@ reasons:
     class. At the point of re-entry, the state of the class might be
     inconsistent. After returning from the function call, the internal state
     might also have changed.
--   Object lifecycle management is complex. When an object registers a callback with another
-    object, it must cancel the callback if it is destructed.
-    This is usually documented in the contract between the
-    objects, but it is hard to test or enforce.
+-   Object lifecycle management is complex. When an object registers a callback
+    with another object, it must cancel the callback if it is destructed. This
+    is usually documented in the contract between the objects, but it is hard to
+    test or enforce.
 
 Coroutines make it possible to write blocking I/O style procedures. They avoid
-callback hell if used properly:
+the "callback hell" if used properly:
 
 -   The code is more streamlined.
 -   Each time a coroutine is created and awaited, the caller's handler
@@ -61,6 +67,7 @@ increasing the cognitive load for reviewers who must track "safe"
 versus "dangerous" callbacks.
 
 # Sequential HTTP Filters with Coroutines
+
 To implement a filter that buffers and parses a bunch of data before it decides
 to forward headers to the next filters, we write something like
 [this](https://github.com/envoyproxy/envoy/blob/main/source/extensions/filters/http/ai_protocol_manager/filter.cc).
@@ -68,35 +75,69 @@ to forward headers to the next filters, we write something like
 Wouldn't it be nice if we can write the following code instead?
 
 ```c++
+// some where in a shared header.
 enum class DecodeResult {
   // the filter has done its job. any further header, body, trailer events skip
   // this filter.
-  kSuccess,
-  // the filter wants to reset and fail the stream.
+  kDone,
+  // the filter wants to stop the filter chain iteration beyond this filter. any
+  // remaining header, body, trailer events are dropped on the floor.
+  kTerminate,
+  // the filter wants to reset the stream.
   kReset,
   // similar to the current recreateStream callback, it restarts the filter
   // chain.
   kRecreateStream,
 };
-HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers) {
-  // status: to signal stream reset or any other failures of the request
-  // headers: a shared_ptr of the header map
-  // header_action_token: can only be used once during forward_headers
-  auto [header_status, headers, header_action_token, data_generator] = co_await get_headers();
 
+// the filter code's cc file.
+HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
+                   LocalReplier reply_locally) {
+  absl::Status status;
+  // RequestHeaders.headers() returns a const std::shared_ptr<RequestHeaderMap>
+  // RequestHeaders is a RequestHeaderMap implementation that delegates all
+  // methods to std::shared_ptr<RequestHeaderMap>, but it is only movable.
+  // We use the move semantic to guarantee that the filter doesn't retain a
+  // non-const header map after forward_headers.
+  std::unique_ptr<RequestHeaders> headers;
+  DataGenerator data_generator;
+
+  // get_headers can only be used once. Compiler warns if a second call is made.
+  std::tie(status, headers, data_generator) = std::move(
+    co_await std::move(get_headers)());
+
+  // Stream level errors are only delivered during co_await. The coroutine does
+  // not need to worry about async cancellation.
+  if (status.ok()) {
+    // It's technically ok for the filter to call get_headers or forward_headers
+    // after reply_locally, but those will result in error status.
+    std::move(reply_locally)(Http::Code::InternalServerError);
+    co_return DecodeResult::kTerminate;
+  }
+
+  // Some custom logic.
   DataParser parser;
-  for co_await (InstancePtr data : data_generator) {
-    if (absl::Status status = co_await parser.feed(data); !status.ok()) {
-      co_return DecodeResult::kReset;
+  while (!parser.hasEnoughData() && !data_generator.end_stream()) {
+    Buffer::InstancePtr data;
+    std::tie(status, data) = std::move(co_await data_generator.next());
+    if (!status.ok()) {
+      std::move(reply_locally)(Http::Code::InternalServerError);
+      co_return DecodeResult::kTerminate;
     }
-    if (parser.hasEnoughData()) {
-      break;
+    // The custom logic itself can be coroutine and async.
+    if (absl::Status status = co_await parser.feed(std::move(data)); !status.ok()) {
+      std::move(reply_locally)(Http::Code::BadRequest);
+      co_return DecodeResult::kTerminate;
     }
-  }
+  };
   if (!parser.hasEnoughData()) {
-    co_return DecodeResult::kReset;
+    std::move(reply_locally)(Http::Code::BadRequest);
+    co_return DecodeResult::kTerminate;
   }
-  auto [status, forward_data] = forward_headers(std::move(header_action_token));
+
+  // Can only get forward_data after forward_headers is called.
+  DataForwarder forward_data;
+  std::tie(status, forward_data) = std::move(forward_headers)(std::move(headers));
   if (!status.ok()) {
     co_return DecodeResult::kReset;
   }
@@ -105,8 +146,14 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers) {
       co_return DecodeResult::kReset;
     }
   }
-  // we don't care about future data and trailers (if any), so they just pass through
+  // we don't care about future data and trailers (if any), so they just pass
+  // through
   co_return DecodeResult::kSuccess;
+
+  // DataForwarder has an override that takes rvalue of itself to signal "end of
+  // data", which might return a trailer forwarder:
+  // TrailerForwarder tf = co_await std::move(forward_data)(data, /*end_stream=*/false);
+  // std::move(tf)(trailers);
 }
 ```
 
@@ -149,4 +196,3 @@ along with timeout support. We could allow each `co_await` call to accept a time
 But hopefully, this gives a rough idea of how things would look.
 
 # More Details
-
