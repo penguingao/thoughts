@@ -160,8 +160,8 @@ Obviously, it can be broken into a few helper function and coroutines to make it
 more readable, but putting it all in one body signifies the sequential nature of
 HTTP processing in this paradigm.
 
-Aside from this, there are other semantic tricks worth pointing out to make this
-appealing:
+## Taking advantage of compiler static analysis
+Aside from this, there are other semantic tricks worth pointing out:
 -   the next action that the filter can take is obtained from acting on the
     previous action. e.g. `DataGenerator` can only be got by reading headers
     off `HeaderGetter`.
@@ -171,11 +171,14 @@ appealing:
 This makes it more likely that the control flow is correct when the code
 compiles.
 
+## Buffering and flow control.
 Aside from correctness, the use of coroutine between `DataGenerator` and
 `DataForwarder` gives the filter explicit control of how much data it buffers.
 Before forwarding, it actively read more data if it has budget and more is
-needed.
+needed. Because `DataForwarder` is `co_await`ed upon, remote flow control push
+back is implicitly implemented.
 
+## Stream life cycle
 Early termination of the HTTP stream is handled by the return status of
 `HeaderGetter` and friends. A pure sequential filter would not need to handle
 cancellation of other async operations because by the time it `co_await`s on any
@@ -183,17 +186,23 @@ of the `HeaderGetter` / `HeaderForwarder` coroutines, it must have finished the
 async operations. The lack of a class object here makes it harder to use
 callbacks, which prevents re-entrance bugs too.
 
-In the rare case where we need a few async events to race, we can still use
-`co_await` to explicitly join the operation.
+If the filter no longer cares about the request, it simply `co_return
+DecodeResult::kContinue`.
 
+In the rare case where we need a few async events to race, we can still use
+`co_await` to explicitly join the operation before `co_return`.
+
+## Other useful information to the filter implementation
 Obviously, we need access to `StreamInfo`, configuration, route tables, etc.
 These functionalities should be provided via synchronous function calls provided
 by `Context`.
 
+## (Somewhat) symmetric response handling and coordination
 We can write response handling in a similar way, which brings the necessity of
 sharing state between `decode()` and `encode()`. This should be handled by
 `Context` providing some async message passing primitives.
 
+## Timeouts
 Writing "blocking" looking code also requires proper timeout support. This
 should be provided by a standard `with_timeout()` wrapper for each async call
 that needs to be time boxed.
