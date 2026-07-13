@@ -88,12 +88,12 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
     // end stream signalled via nullptr. parser hasn't seen enough. error out.
     if (*data == nullptr) {
       std::move(reply_locally)(Http::Code::BadRequest);
-      co_return DecodeResult::kTerminate;
+      co_return DecodeResult::kReset;
     }
     if (absl::Status status = co_await parser.feed(*std::move(data));
         !status.ok()) {
       std::move(reply_locally)(Http::Code::BadRequest);
-      co_return DecodeResult::kTerminate;
+      co_return DecodeResult::kReset;
     }
   };
 
@@ -108,13 +108,13 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
     if (absl::Status status = co_await forward_data(*std::move(buffered_data));
         status.ok()) {
       std::move(reply_locally)(Http::Code::InternalError);
-      co_return DecodeResult::kTerminate;
+      co_return DecodeResult::kReset;
     }
     buffered_data = parser.bufferedData();
   }
   if (!buffered_data.ok()) {
     std::move(reply_locally)(Http::Code::InternalError);
-    co_return DecodeResult::kTerminate;
+    co_return DecodeResult::kReset;
   }
 
   // std::move(forward_data)() signals that we no longer need forward_data, but
@@ -220,10 +220,11 @@ enum class DecodeResult {
   // the filter has done its job. any further header, body, trailer events skip
   // this filter.
   kContinue,
-  // the filter wants to stop the filter chain iteration beyond this filter. any
-  // remaining header, body, trailer events are dropped on the floor.
-  kTerminate,
-  // the filter wants to reset the stream.
+  // the filter wants to reset the stream. if no local reply / local encode has
+  // started, this results in a stream reset (HTTP/1.1 connection closure, and
+  // HTTP/2 stream reset). if local reply / local encode has started, it drops
+  // any further (if any) incoming headers, data and trailers on the floor,
+  // and wait for encoder to finish.
   kReset,
   // similar to the current recreateStream callback, it restarts the filter
   // chain.
@@ -293,20 +294,27 @@ public:
 
 class DataForwarder {
 public:
+  // forwarding nullptr doesn't mean end of data. this is different from getting
+  // nullptr from `DataGeneratora::next()`.
   Coroutine::Task<absl::Status> operator(Buffer::InstancePtr data);
   
   // Receives the trailer forwarder
-  Coroutine::Task<TrailerForwarder> operator(Buffer::InstancePtr data) &&;
-  Coroutine::Task<TrailerForwarder> operator() &&;
+  Coroutine::Task<TrailerForwarder> operator(Buffer::InstancePtr data = nullptr) &&;
 };
 
 class TrailerForwarder {
 public:
-  absl::Status operator(RequestTrailers trailers) &&;
+  // Ends a stream with or without trailers.
+  absl::Status operator(std::optional<RequestTrailers> trailers) &&;
 };
 
 class LocalReplier {
 public:
+  // kicks off the local reply and encoder should be called. once a local reply
+  // is sent, `HeaderGetter` / `DataGenerator` / `TrailerGetter` will return
+  // error for a non-terminating filter. the filter should generally clean
+  // itself up and `co_return`. a terminating filter can keep receiving
+  // remainder of the messages.
   void operator(Http::Code code) &&;
   // more overloads can be provided to provide ease of use.
   // void operator(Http::Code code, ...) &&;
