@@ -73,7 +73,7 @@ Wouldn't it be nice if we can write the following code instead?
 
 ```c++
 HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
-                   LocalReplier reply_locally, Context) {
+                   TerminatingActions terminating_actions, Context) {
   RequestHeaders headers;
   DataGenerator data_generator;
   ASSIGN_OR_CO_RETURN(std::tie(headers, data_generator),
@@ -87,12 +87,12 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
       DecodeResult::kReset);
     // end stream signalled via nullptr. parser hasn't seen enough. error out.
     if (*data == nullptr) {
-      std::move(reply_locally)(Http::Code::BadRequest);
+      std::move(terminating_actions).replyLocally(Http::Code::BadRequest);
       co_return DecodeResult::kReset;
     }
     if (absl::Status status = co_await parser.feed(*std::move(data));
         !status.ok()) {
-      std::move(reply_locally)(Http::Code::BadRequest);
+      std::move(terminating_actions).replyLocally(Http::Code::BadRequest);
       co_return DecodeResult::kReset;
     }
   };
@@ -107,13 +107,13 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
   while (buffered_data.ok() && *buffered_data != nullptr) {
     if (absl::Status status = co_await forward_data(*std::move(buffered_data));
         status.ok()) {
-      std::move(reply_locally)(Http::Code::InternalError);
+      std::move(terminating_actions).replyLocally(Http::Code::InternalError);
       co_return DecodeResult::kReset;
     }
     buffered_data = parser.bufferedData();
   }
   if (!buffered_data.ok()) {
-    std::move(reply_locally)(Http::Code::InternalError);
+    std::move(terminating_actions).replyLocally(Http::Code::InternalError);
     co_return DecodeResult::kReset;
   }
 
@@ -139,20 +139,15 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
 We can also imagine simple filters really just read the headers and `co_return`:
 
 ```c++
-HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
-                   LocalReplier reply_locally) {
+HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder,
+                   TerminatingActions, Context) {
   RequestHeaders headers;
   ASSIGN_OR_CO_RETURN(
     std::tie(headers, std::ignore), co_await std::move(get_headers)(),
     DecodeResult::kReset);
 
   // do things with headers
-
-  ASSIGN_OR_CO_RETURN(
-    std::ignore, std::move(forward_headers)(*std::move(headers)),
-    DecodeResult::kReset);
-
-  co_return DecodeResult::kContinue;
+  co_return DecodeResult::kSkip;
 }
 ```
 
@@ -187,7 +182,7 @@ async operations. The lack of a class object here makes it harder to use
 callbacks, which prevents re-entrance bugs too.
 
 If the filter no longer cares about the request, it simply `co_return
-DecodeResult::kContinue`.
+DecodeResult::kSkip`.
 
 In the rare case where we need a few async events to race, we can still use
 `co_await` to explicitly join the operation before `co_return`.
@@ -212,23 +207,31 @@ Hopefully, this gives a rough idea of how things would look.
 # More Details
 
 If the code snippets look appealing, it would be intriguing to see how the
-interfaces are declared.
+interfaces are declared. To avoid boiling the ocean, we can implement this as a
+common wrapper http filter that bridges the current callback semantics to the
+proposed sequantial coroutine paradigm.
 
 ```c++
 
+// since the coroutine filter can co_return before end_stream, we need to decide
+// what to do after that.
 enum class DecodeResult {
-  // the filter has done its job. any further header, body, trailer events skip
-  // this filter.
-  kContinue,
-  // the filter wants to reset the stream. if no local reply / local encode has
-  // started, this results in a stream reset (HTTP/1.1 connection closure, and
-  // HTTP/2 stream reset). if local reply / local encode has started, it drops
-  // any further (if any) incoming headers, data and trailers on the floor,
-  // and wait for encoder to finish.
+  // the filter has done its job. any further unread header, body, trailer
+  // events skip this filter.
+  //
+  // for headers and trailers that has been read, but not forwarded, they are
+  // forwarded automatically.
+  //
+  // for data that has been read but not forwarded, it is dropped.
+  //
+  // since local reply inhibits filter chain iteration, kSkip is the same as
+  // kReset.
+  kSkip,
+  // the filter wants to reset the stream if any more event is seen. if no local
+  // reply has started, this results in a stream reset (HTTP/1.1 connection
+  // closure, and HTTP/2 stream reset), on any further event. if local reply has
+  // started, there shouldn't be any decode event any way.
   kReset,
-  // similar to the current recreateStream callback, it restarts the filter
-  // chain.
-  kRecreateStream,
 };
 
 class RequestHeaders : public RequestHeaderMap {
@@ -296,27 +299,44 @@ class DataForwarder {
 public:
   // forwarding nullptr doesn't mean end of data. this is different from getting
   // nullptr from `DataGeneratora::next()`.
-  Coroutine::Task<absl::Status> operator(Buffer::InstancePtr data);
+  Coroutine::Task<absl::Status> operator() (Buffer::InstancePtr data);
   
   // Receives the trailer forwarder
-  Coroutine::Task<TrailerForwarder> operator(Buffer::InstancePtr data = nullptr) &&;
+  Coroutine::Task<TrailerForwarder> operator() (Buffer::InstancePtr data = nullptr) &&;
 };
 
 class TrailerForwarder {
 public:
   // Ends a stream with or without trailers.
-  absl::Status operator(std::optional<RequestTrailers> trailers) &&;
+  absl::Status operator() (std::optional<RequestTrailers> trailers) &&;
 };
 
-class LocalReplier {
+class TerminatingActions {
 public:
   // kicks off the local reply and encoder should be called. once a local reply
   // is sent, `HeaderGetter` / `DataGenerator` / `TrailerGetter` will return
   // error for a non-terminating filter. the filter should generally clean
   // itself up and `co_return`. a terminating filter can keep receiving
   // remainder of the messages.
-  void operator(Http::Code code) &&;
+  void replyLocally(Http::Code code) &&;
+
+  // attempts to recreate the filter chain. once started (ok status)
+  // `HeaderGetter` / `DataGenerator` / `TrailerGetter` will return error. the
+  // filter should clean itself up.
+  absl::StaturOr recreateStream() &&;
+
   // more overloads can be provided to provide ease of use.
-  // void operator(Http::Code code, ...) &&;
 };
+
 ```
+
+## Decode encode communication
+
+In the case where the encode path (response) needs to get some infromation
+from the decode path (request), we take use of the Context object. In the
+wrapper filter, we provide a base class that provides `StreamInfo` and the
+likes. A filter can choose to implement a subclass of Context that provides
+additional methods or awaitable coroutines to pass information from decode path
+to encode path. A typical filter should content with synchronous setter and
+getter methods. In the rare case async behavior is needed, coroutine be be
+implemented.
