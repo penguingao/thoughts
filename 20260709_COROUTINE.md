@@ -74,39 +74,64 @@ Wouldn't it be nice if we can write the following code instead?
 ```c++
 HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
                    LocalReplier reply_locally) {
-  absl::StatusOr<RequestHeaders> headers;
+  RequestHeaders headers;
   DataGenerator data_generator;
-  ASSIGN_OR_CO_RETURN(
-    std::tie(headers, data_generator), co_await std::move(get_headers)(), DecodeResult::kReset);
+  ASSIGN_OR_CO_RETURN(std::tie(headers, data_generator),
+    co_await std::move(get_headers)(), DecodeResult::kReset);
 
-  // Some custom logic.
-  DataParser parser;
-  while (!parser.hasEnoughData() && !data_generator.end_stream()) {
+  // parser uses headers to help parsing.
+  DataParser parser(headers);
+
+  while (!parser.hasEnoughData()) {
     ASSIGN_OR_CO_RETURN(
-      absl::StaturOr<Buffer::InstancePtr> data, co_await data_generator.next(),
+      Buffer::InstancePtr data, co_await data_generator.next(),
       DecodeResult::kReset);
-
-    if (absl::Status status = co_await parser.feed(*std::move(data)); !status.ok()) {
+    // end stream signalled via nullptr. parser hasn't seen enough. error out.
+    if (*data == nullptr) {
+      std::move(reply_locally)(Http::Code::BadRequest);
+      co_return DecodeResult::kTerminate;
+    }
+    // bad data. error out.
+    if (absl::Status status = co_await parser.feed(*std::move(data));
+        !status.ok()) {
       std::move(reply_locally)(Http::Code::BadRequest);
       co_return DecodeResult::kTerminate;
     }
   };
-  if (!parser.hasEnoughData()) {
-    std::move(reply_locally)(Http::Code::BadRequest);
-    co_return DecodeResult::kTerminate;
-  }
 
-  absl::Status status;
+  // start proxying / forwarding.
   DataForwarder forward_data;
-
   ASSIGN_OR_CO_RETURN(
-    std::tie(status, forward_data), std::move(forward_headers)(*std::move(headers)),
+    forward_data, std::move(forward_headers)(std::move(headers)),
     DecodeResult::kReset);
 
   absl::StatusOr<Buffer::InstancePtr> buffered_data = parser.bufferedData();
   while (buffered_data.ok() && *buffered_data != nullptr) {
-    CO_RETURN_IF_ERROR(
-      co_await forward_data(*std::move(buffered_data)), DecodeResult::kReset);
+    if (absl::Status status = co_await forward_data(*std::move(buffered_data));
+        status.ok()) {
+      std::move(reply_locally)(Http::Code::InternalError);
+      co_return DecodeResult::kTerminate;
+    }
+    buffered_data = parser.bufferedData();
+  }
+  if (!buffered_data.ok()) {
+    std::move(reply_locally)(Http::Code::InternalError);
+    co_return DecodeResult::kTerminate;
+  }
+
+  // std::move(forward_data)() signals that we no longer need forward_data, but
+  // it doesn't signal end stream. std::move(forward_data)(nullptr) does.
+  ASSIGN_OR_CO_RETURN(
+    TrailerForwarder forward_trailers, co_await std::move(forward_data)(),
+    DecodeResult::kReset);
+
+  // can be called before end stream.
+  TrailerGetter get_trailers = std::move(data_generator).finalize();
+  ASSIGN_OR_RETURN(
+    std::optional<RequestTrailers> trailers, co_await std::move(get_trailers)(),
+    DecodeResult::kReset);
+  if (tarilers.has_data()) {
+    std::move(forward_trailers)(std::move(trailers));
   }
 
   co_return DecodeResult::kSuccess;
