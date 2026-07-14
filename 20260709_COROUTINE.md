@@ -1,9 +1,17 @@
+**tl;dr;** C++20 provides primitives to implement coroutine. Coroutine enables
+writing asynchronous logic in sequential style, which is easier to reason about.
+This document outlines a common Envoy wrapper HTTP filter that makes it possible
+to write HTTP filter logic in coroutines. It makes use of compiler semantics to
+enforce correct sequence of actions that a filter can perform. The goal is to
+lower cognitive for code authoers and reviewers so that they can focus on higher
+level goals than Envoy internals.
+
 # C++20 coroutine support
 
 C++20 introduced compiler primitives to support
 [coroutines](https://en.cppreference.com/cpp/language/coroutines). Coroutines
-look like functions, but they do not reside on the stack. It allows wrting
-asynchronous code as sequential-looking functions, making it eader to reason
+look like functions, but they do not reside on the stack. It allows writing
+asynchronous code as sequential-looking functions, making it easier to reason
 about.
 
 If a function contains `co_await`, `co_yield` or `co_return`, it is a coroutine.
@@ -24,7 +32,7 @@ reasons:
 
 -   They fragment a sequence of event handling logic into many functions, making
     it harder to trace and see the big picture.
--   This naturally requires a lot of states stored in objects for functions to
+-   This naturally requires a lot of state stored in objects for functions to
     understand the context.
 -   The many callbacks make debugging difficult because the call stack doesn't
     naturally carry the "why" of an event. We only know "how" a callback is
@@ -86,11 +94,11 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
       Buffer::InstancePtr data, co_await data_generator.next(),
       DecodeResult::kReset);
     // end stream signalled via nullptr. parser hasn't seen enough. error out.
-    if (*data == nullptr) {
+    if (data == nullptr) {
       std::move(terminating_actions).replyLocally(Http::Code::BadRequest);
       co_return DecodeResult::kReset;
     }
-    if (absl::Status status = co_await parser.feed(*std::move(data));
+    if (absl::Status status = co_await parser.feed(std::move(data));
         !status.ok()) {
       std::move(terminating_actions).replyLocally(Http::Code::BadRequest);
       co_return DecodeResult::kReset;
@@ -106,7 +114,7 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
   absl::StatusOr<Buffer::InstancePtr> buffered_data = parser.bufferedData();
   while (buffered_data.ok() && *buffered_data != nullptr) {
     if (absl::Status status = co_await forward_data(*std::move(buffered_data));
-        status.ok()) {
+        !status.ok()) {
       std::move(terminating_actions).replyLocally(Http::Code::InternalError);
       co_return DecodeResult::kReset;
     }
@@ -128,11 +136,11 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
   ASSIGN_OR_RETURN(
     std::optional<RequestTrailers> trailers, co_await std::move(get_trailers)(),
     DecodeResult::kReset);
-  if (tarilers.has_data()) {
+  if (trailers.has_value()) {
     std::move(forward_trailers)(std::move(trailers));
   }
 
-  co_return DecodeResult::kConinue;
+  co_return DecodeResult::kContinue;
 }
 ```
 
@@ -151,15 +159,17 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder,
 }
 ```
 
-Obviously, it can be broken into a few helper function and coroutines to make it
-more readable, but putting it all in one body signifies the sequential nature of
-HTTP processing in this paradigm.
+Obviously, it can be broken into a few helper functions and coroutines to make
+it more readable, but putting it all in one body signifies the sequential nature
+of HTTP processing in this paradigm.
 
 ## Taking advantage of compiler static analysis
+
 Aside from this, there are other semantic tricks worth pointing out:
+
 -   the next action that the filter can take is obtained from acting on the
-    previous action. e.g. `DataGenerator` can only be got by reading headers
-    off `HeaderGetter`.
+    previous action. e.g. `DataGenerator` can only be got by reading headers off
+    `HeaderGetter`.
 -   we use rvalue ref-qualifier on `operator()` (`operator() (...) &&`) to force
     revocation of an action. e.g. `std::move(forward_header)()`.
 
@@ -167,13 +177,15 @@ This makes it more likely that the control flow is correct when the code
 compiles.
 
 ## Buffering and flow control.
+
 Aside from correctness, the use of coroutine between `DataGenerator` and
 `DataForwarder` gives the filter explicit control of how much data it buffers.
-Before forwarding, it actively read more data if it has budget and more is
+Before forwarding, it actively reads more data if it has budget and more is
 needed. Because `DataForwarder` is `co_await`ed upon, remote flow control push
 back is implicitly implemented.
 
 ## Stream life cycle
+
 Early termination of the HTTP stream is handled by the return status of
 `HeaderGetter` and friends. A pure sequential filter would not need to handle
 cancellation of other async operations because by the time it `co_await`s on any
@@ -188,16 +200,19 @@ In the rare case where we need a few async events to race, we can still use
 `co_await` to explicitly join the operation before `co_return`.
 
 ## Other useful information to the filter implementation
+
 Obviously, we need access to `StreamInfo`, configuration, route tables, etc.
 These functionalities should be provided via synchronous function calls provided
 by `Context`.
 
 ## (Somewhat) symmetric response handling and coordination
+
 We can write response handling in a similar way, which brings the necessity of
 sharing state between `decode()` and `encode()`. This should be handled by
 `Context` providing some async message passing primitives.
 
 ## Timeouts
+
 Writing "blocking" looking code also requires proper timeout support. This
 should be provided by a standard `with_timeout()` wrapper for each async call
 that needs to be time boxed.
@@ -234,14 +249,36 @@ enum class DecodeResult {
   kReset,
 };
 
+#define FORWARD_INLINE_HEADER_FUNCS(name)   \
+  const HeaderEntry* name() const override { return backing_map_->name(); } \
+  size_t remove##name() override { return back_map_->remove##name(); } \
+  absl::string_view get##name##Value() const override { return backing_map_->get##name##Value(); } \
+  void set##name(absl::string_view value) override { backing_map_->set##name(value); }
+
+#define FORWARD_INLINE_HEADER_STRING_FUNCS(name) \
+  FORWARD_INLINE_HEADER_FUNCS(name) \
+  void append##name(absl::string_view data, absl::string_view delimiter) override { \
+    backing_map_->append##name(data, delimiter); \
+  } \
+  void setReference##name(absl::string_view value) override { \
+    backing_map_->setReference##name(value); \
+  }
+
+#define FORWARD_INLINE_HEADER_NUMERIC_FUNCS(name) \
+  FORWARD_INLINE_HEADER_FUNDS(name) \
+  void set##name(uint64_t value) override { \
+    backing_map_->set##name(value);
+  \}
+
 class RequestHeaders : public RequestHeaderMap {
 private:
   RequestHeaderMapSharedPtr backing_map_;
 public:
-  // DEFINE_INLINE_STRING_HEADER delegates methods to `backing_map_`
-  INLINE_REQ_RESP_STRING_HEADERS(DEFINE_INLINE_STRING_HEADER)
-  INLINE_REQ_RESP_NUMERIC_HEADERS(DEFINE_INLINE_NUMERIC_HEADER)
-  
+  INLINE_REQ_RESP_STRING_HEADERS(FORWARD_INLINE_HEADER_STRING_FUNCS)
+  INLINE_REQ_RESP_NUMERIC_HEADERS(FORWARD_INLINE_HEADER_NUMERIC_FUNCS)
+  INLINE_REQ_STRING_HEADERS(FORWARD_INLINE_HEADER_STRING_FUNCS)
+  INLINE_REQ_NUMERIC_HEADERS(FORWARD_INLINE_HEADER_NUMERIC_FUNCS)
+
   // Provides a read-only view into the header map even after headers are
   // forwarded.
   RequestHeaderMapConstSharedPtr read_only_headers() const;
@@ -251,11 +288,11 @@ public:
   RequestHeaders& operator=(const RequestHeaders&) = delete;
 
   // Moveable.
-  RequestHeaders(const RequestHeaders&& other) {
+  RequestHeaders(RequestHeaders&& other) {
     backing_map_ = other.backing_map_;
     other.backing_map_ = nullptr;
   }
-  RequestHeaders& operator=(const RequestHeaders&&) {
+  RequestHeaders& operator=(RequestHeaders&&) {
     backing_map_ = other.backing_map_;
     other.backing_map_ = nullptr;
     return *this;
@@ -264,15 +301,15 @@ public:
 
 class HeaderGetter {
 public:
-  Coroutine::Task<absl::StatusOr<RequestHeaders, DataGenerator>> operator() &&;
+  Coroutine::Task<absl::StatusOr<std::tuple<RequestHeaders, DataGenerator>>> operator() ()  &&;
   // other methods to interact with the real http filter.
 };
 
 class DataGenerator {
 public:
   // Awaits the next chunk.
-  // 
-  // Status signals error condition, and the filter should start clean itself
+  //
+  // Status signals error condition, and the filter should start cleaning itself
   // up.
   //
   // Buffer is nullptr when there is no more data. Further calls might return
@@ -286,13 +323,13 @@ public:
 
 class TrailerGetter {
 public:
-  Coroutine::Task<absl::StatusOr<std::optional<RequestTrailers>>> operator() &&;
+  Coroutine::Task<absl::StatusOr<std::optional<RequestTrailers>>> operator() () &&;
   // other methods to interact with the real http filter.
 };
 
 class HeaderForwarder {
 public:
-  absl::StatusOr<DataForwarder> operator() &&; 
+  absl::StatusOr<DataForwarder> operator() (RequestHeaders headers)&&;
 };
 
 class DataForwarder {
@@ -300,7 +337,7 @@ public:
   // forwarding nullptr doesn't mean end of data. this is different from getting
   // nullptr from `DataGeneratora::next()`.
   Coroutine::Task<absl::Status> operator() (Buffer::InstancePtr data);
-  
+
   // Receives the trailer forwarder
   Coroutine::Task<TrailerForwarder> operator() (Buffer::InstancePtr data = nullptr) &&;
 };
@@ -332,11 +369,29 @@ public:
 
 ## Decode encode communication
 
-In the case where the encode path (response) needs to get some infromation
-from the decode path (request), we take use of the Context object. In the
-wrapper filter, we provide a base class that provides `StreamInfo` and the
-likes. A filter can choose to implement a subclass of Context that provides
-additional methods or awaitable coroutines to pass information from decode path
-to encode path. A typical filter should content with synchronous setter and
-getter methods. In the rare case async behavior is needed, coroutine be be
-implemented.
+In the case where the encode path (response) needs to get some infromation from
+the decode path (request), we take use of the Context object. In the wrapper
+filter, we provide a base class that provides `StreamInfo` and the likes. A
+filter can choose to implement a subclass of Context that provides additional
+methods or awaitable coroutines to pass information from decode path to encode
+path. A typical filter should content with synchronous setter and getter
+methods. In the rare case async behavior is needed, coroutine be be implemented.
+
+## Coroutine life cycle
+
+To make memory management cleaner, a coroutine controls its full life cycle - it
+decides when to suspend and when to return. We don't destroy the coroutine even
+when the HTTP stream is reset. The coroutine learns that the stream is reset
+when it makes call to one of the getters, forwarders, and the terminating
+actions, which will always return error after the stream reset.
+
+Note that the coroutine filter can still perform some final actions to clean up
+whatever state it wants to, but any of the actions, and context might be invalid
+at this point.
+
+## Re-entrancy
+
+The wrapper filter's implementation will need to be carefully written to avoid
+re-entrancy to itself while it interacts with HCM / filter manager. Where
+possible, tail call should be used to make sure the code is reentrant safe. This
+is the biggest risk of this design.
