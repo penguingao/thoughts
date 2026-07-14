@@ -227,9 +227,14 @@ sharing state between `decode()` and `encode()`. This should be handled by
 
 ## Timeouts
 
-Writing "blocking" looking code also requires proper timeout support. This
-should be provided by a standard `with_timeout()` wrapper for each async call
-that needs to be time boxed.
+Writing "blocking"-looking code requires timeout support. Rather than forcing an
+explicit `with_timeout()` wrapper onto every call, each `Task` carries a default
+timeout, so an await cannot hang indefinitely by accident. `with_timeout()`
+remains available to override the default — tighten or extend it — for a specific
+call. The default timeout is also what makes the life-cycle contract hold in
+practice: it bounds "every non-stream awaitable must eventually complete or be
+cancellable", so a coroutine parked on a stalled operation aborts on its own well
+before the pending-task watchdog has to step in.
 
 Hopefully, this gives a rough idea of how things would look.
 
@@ -429,10 +434,12 @@ gone simply keeps awaiting non-stream operations and never touches the dead
 stream again — without any explicit `detach()` call.
 
 This rests on one contract: **every non-stream awaitable the coroutine can park
-on must eventually complete or be cancellable.** Bounded I/O and timers satisfy
-it. The trap is an awaitable whose producer died with the stream (for example, a
-decode↔encode `Context` primitive whose peer is gone) — it must supply its own
-completion/abort, or the coroutine parks forever.
+on must eventually complete or be cancellable.** The default `Task` timeout (see
+Timeouts) normally satisfies it — an awaited operation aborts on its own after
+the timeout. The trap is an awaitable that escapes that default and whose
+producer died with the stream (for example, a decode↔encode `Context` primitive
+whose peer is gone) — it must supply its own completion/abort, or the coroutine
+parks forever.
 
 ### Ownership and destruction
 
