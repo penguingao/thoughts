@@ -181,18 +181,22 @@ There are a couple of semantic tricks worth pointing out:
 
 -   The next action a filter can take is obtained from acting on the previous
     one. e.g. `DataGenerator` can only be obtained by reading headers off
-    `HeaderGetter`. This makes some incorrect orderings unrepresentable.
+    `HeaderGetter`. This makes incorrect or out-of-sequence orderings unrepresentable in code.
 -   We use an rvalue ref-qualifier on `operator()` (`operator() (...) &&`) to
     signal that an action is consumed by the call, e.g.
     `std::move(forward_header)()`.
 
-These rule out some misorderings, but they are not a full linear-type system: a
-ref-qualifier does not stop `std::move(x)()` from being called twice, so
-double-use is caught at runtime (subsequent calls return an error), not at
-compile time. Clang's consumable-type attributes (`[[clang::consumable]]`,
-`[[clang::callable_when]]`, `[[clang::set_typestate]]`) could push single-use
-enforcement to compile time under Envoy's warnings-as-errors; this is worth
-validating.
+By requiring explicit `std::move(...)` to yield or transition actions, we leverage
+the C++ compiler to enforce affine/linear state transitions. This shifts control-flow
+correctness verification from fallible human code reviews to automated compiler checks:
+a developer cannot accidentally execute actions out of sequence or bypass required intermediate steps.
+
+While rvalue ref-qualifiers enforce that lvalues cannot be reused directly without `std::move`,
+a ref-qualifier alone does not prevent `std::move(x)()` from being called twice on a moved object;
+in the runtime implementation, subsequent calls return an error. To elevate single-use
+enforcement to compile-time errors, we combine Clang's consumable-type attributes
+(`[[clang::consumable]]`, `[[clang::callable_when]]`, `[[clang::set_typestate]]`) with static analysis
+(see [Static analysis & memory safety enforcements](#static-analysis--memory-safety-enforcements) in More Details).
 
 ## Buffering and flow control.
 
@@ -482,9 +486,58 @@ stream is reset. Cleanup that must run on reset should therefore be expressed as
 RAII (destructors / `absl::Cleanup`), which run on the normal `co_return` unwind
 and may safely use `Context`.
 
+## Static analysis & memory safety enforcements
+
+To complement compile-time type-state checks (`&&` ref-qualifiers) and prevent common C++20 coroutine memory hazards (such as holding non-owning references across `co_await` suspend points), the coroutine filter framework relies on automated static analysis in Envoy's build and CI toolchain.
+
+### 1. Preventing dangling local references across `co_await`
+
+In C++20 coroutines, storing non-owning reference types (e.g., `absl::string_view`, `std::string_view`, `T&`, raw pointers) in local variables across `co_await` suspend points creates Use-After-Free hazards if the underlying HTTP stream or header map is destroyed while suspended.
+
+To enforce local variable safety automatically, a custom **Clang-Tidy AST Matcher** rule is configured in CI:
+
+```c++
+// Clang-Tidy AST matcher rule: flag non-owning local variables that persist across co_await
+varDecl(
+  isLocalVarDecl(),
+  hasType(isNonOwningType()), // matches absl::string_view, std::string_view, T&, T*, std::span
+  hasAncestor(coroutineBodyStmt()),
+  isLiveAcrossSuspendPoint()
+).bind("dangling_coroutine_local");
+```
+
+When triggered under Envoy's `-Werror` build rules, this AST matcher fails the build if a developer attempts to keep a string view or reference view across a suspend point, forcing them to store an owned type (`std::string`, `HeaderMapConstSharedPtr`) or re-query after resuming.
+
+### 2. Clang lifetime attributes (`[[clang::lifetimebound]]` & `-Wdangling-gsl`)
+
+The header interfaces and getters are annotated with Clang lifetime bounds:
+
+```c++
+class RequestHeaders {
+public:
+  absl::string_view getPathValue() const [[clang::lifetimebound]];
+};
+```
+
+Building with `-Wdangling-gsl` enables Clang's GSL (Guidelines Support Library) lifetime safety analysis. The compiler treats `absl::string_view` as a `[[gsl::Pointer]]` bound to the `RequestHeaders` `[[gsl::Owner]]`. If the `RequestHeaders` instance is moved or consumed prior to a `co_await`, Clang issues a dangling reference compiler warning.
+
+### 3. Compile-time typestate checks (`[[clang::consumable]]`)
+
+To complement the rvalue ref-qualifiers (`operator()() &&`) discussed in [Taking advantage of the type system](#taking-advantage-of-the-type-system), action classes (`HeaderForwarder`, `DataForwarder`, `TrailerForwarder`) are annotated with Clang's consumable-type attributes:
+
+```c++
+class [[clang::consumable(unconsumed)]] HeaderForwarder {
+public:
+  absl::StatusOr<DataForwarder> operator()(RequestHeaders headers) &&
+      [[clang::callable_when(unconsumed)]] [[clang::set_typestate(consumed)]];
+};
+```
+
+This causes Clang static analysis to issue a compile-time error/warning if `std::move(forward_headers)(...)` is called more than once on the same object instance.
+
 ## Re-entrancy
 
 The wrapper filter's implementation will need to be carefully written to avoid
 re-entrancy to itself while it interacts with HCM / filter manager. Where
-possible, tail call should be used to make sure the code is reentrant safe. This
+possible, tail calls should be used to make sure the code is reentrant safe. This
 is the biggest risk of this design.
