@@ -3,8 +3,8 @@ writing asynchronous logic in sequential style, which is easier to reason about.
 This document outlines a common Envoy wrapper HTTP filter that makes it possible
 to write HTTP filter logic in coroutines. It makes use of compiler semantics to
 enforce correct sequence of actions that a filter can perform. The goal is to
-lower cognitive for code authoers and reviewers so that they can focus on higher
-level goals than Envoy internals.
+lower cognitive load for code authors and reviewers so that they can focus on
+higher level goals than Envoy internals.
 
 # C++20 coroutine support
 
@@ -85,62 +85,55 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
   RequestHeaders headers;
   DataGenerator data_generator;
   ASSIGN_OR_CO_RETURN(std::tie(headers, data_generator),
-    co_await std::move(get_headers)(), DecodeResult::kReset);
+    co_await std::move(get_headers)());
 
-  // parser uses headers to help parsing.
-  DataParser parser(headers);
+  // parser uses a read-only view of the headers so it stays valid after the
+  // headers are forwarded (moved) below.
+  DataParser parser(headers.read_only_headers());
   while (!parser.hasEnoughData()) {
     ASSIGN_OR_CO_RETURN(
-      Buffer::InstancePtr data, co_await data_generator.next(),
-      DecodeResult::kReset);
+      Buffer::InstancePtr data, co_await data_generator.next());
     // end stream signalled via nullptr. parser hasn't seen enough. error out.
     if (data == nullptr) {
-      std::move(terminating_actions).replyLocally(Http::Code::BadRequest);
-      co_return DecodeResult::kReset;
+      co_return std::move(terminating_actions).replyLocally(Http::Code::BadRequest);
     }
     if (absl::Status status = co_await parser.feed(std::move(data));
         !status.ok()) {
-      std::move(terminating_actions).replyLocally(Http::Code::BadRequest);
-      co_return DecodeResult::kReset;
+      co_return std::move(terminating_actions).replyLocally(Http::Code::BadRequest);
     }
-  };
+  }
 
   // start proxying / forwarding.
   DataForwarder forward_data;
   ASSIGN_OR_CO_RETURN(
-    forward_data, std::move(forward_headers)(std::move(headers)),
-    DecodeResult::kReset);
+    forward_data, std::move(forward_headers)(std::move(headers)));
 
   absl::StatusOr<Buffer::InstancePtr> buffered_data = parser.bufferedData();
   while (buffered_data.ok() && *buffered_data != nullptr) {
     if (absl::Status status = co_await forward_data(*std::move(buffered_data));
         !status.ok()) {
-      std::move(terminating_actions).replyLocally(Http::Code::InternalError);
-      co_return DecodeResult::kReset;
+      co_return std::move(terminating_actions).replyLocally(Http::Code::InternalError);
     }
     buffered_data = parser.bufferedData();
   }
   if (!buffered_data.ok()) {
-    std::move(terminating_actions).replyLocally(Http::Code::InternalError);
-    co_return DecodeResult::kReset;
+    co_return std::move(terminating_actions).replyLocally(Http::Code::InternalError);
   }
 
-  // std::move(forward_data)() signals that we no longer need forward_data, but
-  // it doesn't signal end stream. std::move(forward_data)(nullptr) does.
+  // Finish body forwarding and transition to trailer mode. This does not end
+  // the stream; the stream ends when forward_trailers is invoked below.
   ASSIGN_OR_CO_RETURN(
-    TrailerForwarder forward_trailers, co_await std::move(forward_data)(),
-    DecodeResult::kReset);
+    TrailerForwarder forward_trailers, co_await std::move(forward_data)());
 
   // can be called before end stream.
   TrailerGetter get_trailers = std::move(data_generator).finalize();
-  ASSIGN_OR_RETURN(
-    std::optional<RequestTrailers> trailers, co_await std::move(get_trailers)(),
-    DecodeResult::kReset);
+  ASSIGN_OR_CO_RETURN(
+    std::optional<RequestTrailers> trailers, co_await std::move(get_trailers)());
   if (trailers.has_value()) {
     std::move(forward_trailers)(std::move(trailers));
   }
 
-  co_return DecodeResult::kContinue;
+  co_return PostDecodeAction::kSkip;
 }
 ```
 
@@ -151,11 +144,10 @@ HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder,
                    TerminatingActions, Context) {
   RequestHeaders headers;
   ASSIGN_OR_CO_RETURN(
-    std::tie(headers, std::ignore), co_await std::move(get_headers)(),
-    DecodeResult::kReset);
+    std::tie(headers, std::ignore), co_await std::move(get_headers)());
 
   // do things with headers
-  co_return DecodeResult::kSkip;
+  co_return PostDecodeAction::kSkip;
 }
 ```
 
@@ -163,18 +155,44 @@ Obviously, it can be broken into a few helper functions and coroutines to make
 it more readable, but putting it all in one body signifies the sequential nature
 of HTTP processing in this paradigm.
 
-## Taking advantage of compiler static analysis
+## Error handling
 
-Aside from this, there are other semantic tricks worth pointing out:
+Fallible steps return `absl::Status` / `absl::StatusOr`. Two kinds of failure
+show up, and they call for different handling:
 
--   the next action that the filter can take is obtained from acting on the
-    previous action. e.g. `DataGenerator` can only be got by reading headers off
-    `HeaderGetter`.
--   we use rvalue ref-qualifier on `operator()` (`operator() (...) &&`) to force
-    revocation of an action. e.g. `std::move(forward_header)()`.
+-   Stream / infrastructure failures. Getters and forwarders return an error once
+    the stream can no longer make progress (for example, after it is reset). The
+    response is always the same — stop and return the filter's default action —
+    so these are propagated with `ASSIGN_OR_CO_RETURN` and need no per-site
+    handling.
+-   The filter's own domain errors, such as a parse failure. These call for
+    different responses (a `BadRequest` versus an `InternalError` local reply),
+    so they are handled with an explicit branch.
 
-This makes it more likely that the control flow is correct when the code
-compiles.
+Two conveniences keep the common case terse. The coroutine's promise carries a
+default `PostDecodeAction` (`kReset`) that `ASSIGN_OR_CO_RETURN` returns on error,
+so propagation sites do not repeat it. And `TerminatingActions::replyLocally`
+returns the `PostDecodeAction` to `co_return`, collapsing the reply-then-return
+pair into a single statement.
+
+## Taking advantage of the type system
+
+There are a couple of semantic tricks worth pointing out:
+
+-   The next action a filter can take is obtained from acting on the previous
+    one. e.g. `DataGenerator` can only be obtained by reading headers off
+    `HeaderGetter`. This makes some incorrect orderings unrepresentable.
+-   We use an rvalue ref-qualifier on `operator()` (`operator() (...) &&`) to
+    signal that an action is consumed by the call, e.g.
+    `std::move(forward_header)()`.
+
+These rule out some misorderings, but they are not a full linear-type system: a
+ref-qualifier does not stop `std::move(x)()` from being called twice, so
+double-use is caught at runtime (subsequent calls return an error), not at
+compile time. Clang's consumable-type attributes (`[[clang::consumable]]`,
+`[[clang::callable_when]]`, `[[clang::set_typestate]]`) could push single-use
+enforcement to compile time under Envoy's warnings-as-errors; this is worth
+validating.
 
 ## Buffering and flow control.
 
@@ -186,18 +204,14 @@ back is implicitly implemented.
 
 ## Stream life cycle
 
-Early termination of the HTTP stream is handled by the return status of
-`HeaderGetter` and friends. A pure sequential filter would not need to handle
-cancellation of other async operations because by the time it `co_await`s on any
-of the `HeaderGetter` / `HeaderForwarder` coroutines, it must have finished the
-async operations. The lack of a class object here makes it harder to use
-callbacks, which prevents re-entrance bugs too.
+Early termination of the HTTP stream is surfaced through the return status of
+`HeaderGetter` and friends: after a reset they abort, and the coroutine unwinds
+the next time it touches a stream operation (see Coroutine life cycle below). The
+lack of a class object here makes it harder to use callbacks, which prevents
+re-entrance bugs too.
 
 If the filter no longer cares about the request, it simply `co_return
-DecodeResult::kSkip`.
-
-In the rare case where we need a few async events to race, we can still use
-`co_await` to explicitly join the operation before `co_return`.
+PostDecodeAction::kSkip`.
 
 ## Other useful information to the filter implementation
 
@@ -224,34 +238,35 @@ Hopefully, this gives a rough idea of how things would look.
 If the code snippets look appealing, it would be intriguing to see how the
 interfaces are declared. To avoid boiling the ocean, we can implement this as a
 common wrapper http filter that bridges the current callback semantics to the
-proposed sequantial coroutine paradigm.
+proposed sequential coroutine paradigm.
 
 ```c++
 
-// since the coroutine filter can co_return before end_stream, we need to decide
-// what to do after that.
-enum class DecodeResult {
-  // the filter has done its job. any further unread header, body, trailer
-  // events skip this filter.
+// The coroutine can co_return before end_stream, so it must declare how any
+// remaining stream events are treated after it returns.
+enum class PostDecodeAction {
+  // The filter is done and future events bypass it: any further unread header,
+  // body, or trailer events skip this filter.
   //
-  // for headers and trailers that has been read, but not forwarded, they are
-  // forwarded automatically.
+  // Headers and trailers that were read but not forwarded are forwarded
+  // automatically. Data that was read but not forwarded is dropped.
   //
-  // for data that has been read but not forwarded, it is dropped.
-  //
-  // since local reply inhibits filter chain iteration, kSkip is the same as
-  // kReset.
+  // This is the normal successful completion — the filter has finished and lets
+  // the rest of the stream pass through untouched.
   kSkip,
-  // the filter wants to reset the stream if any more event is seen. if no local
-  // reply has started, this results in a stream reset (HTTP/1.1 connection
-  // closure, and HTTP/2 stream reset), on any further event. if local reply has
-  // started, there shouldn't be any decode event any way.
+  // The filter wants to reset the stream on any further event. If no local reply
+  // has started, any further event triggers a stream reset (HTTP/1.1 connection
+  // closure, HTTP/2 stream reset). If a local reply has started there will be no
+  // further decode events anyway.
+  //
+  // kSkip and kReset differ only in how future events are handled; they coincide
+  // when a local reply guarantees there are no future events.
   kReset,
 };
 
 #define FORWARD_INLINE_HEADER_FUNCS(name)   \
   const HeaderEntry* name() const override { return backing_map_->name(); } \
-  size_t remove##name() override { return back_map_->remove##name(); } \
+  size_t remove##name() override { return backing_map_->remove##name(); } \
   absl::string_view get##name##Value() const override { return backing_map_->get##name##Value(); } \
   void set##name(absl::string_view value) override { backing_map_->set##name(value); }
 
@@ -265,10 +280,10 @@ enum class DecodeResult {
   }
 
 #define FORWARD_INLINE_HEADER_NUMERIC_FUNCS(name) \
-  FORWARD_INLINE_HEADER_FUNDS(name) \
+  FORWARD_INLINE_HEADER_FUNCS(name) \
   void set##name(uint64_t value) override { \
-    backing_map_->set##name(value);
-  \}
+    backing_map_->set##name(value); \
+  }
 
 class RequestHeaders : public RequestHeaderMap {
 private:
@@ -292,7 +307,7 @@ public:
     backing_map_ = other.backing_map_;
     other.backing_map_ = nullptr;
   }
-  RequestHeaders& operator=(RequestHeaders&&) {
+  RequestHeaders& operator=(RequestHeaders&& other) {
     backing_map_ = other.backing_map_;
     other.backing_map_ = nullptr;
     return *this;
@@ -334,11 +349,13 @@ public:
 
 class DataForwarder {
 public:
-  // forwarding nullptr doesn't mean end of data. this is different from getting
-  // nullptr from `DataGeneratora::next()`.
+  // Forwards a body chunk. Forwarding nullptr forwards an empty chunk; it does
+  // NOT signal end of data (unlike a nullptr from `DataGenerator::next()`).
   Coroutine::Task<absl::Status> operator() (Buffer::InstancePtr data);
 
-  // Receives the trailer forwarder
+  // Finishes body forwarding and transitions to trailer mode, handing back a
+  // TrailerForwarder. Neither overload ends the stream; the stream ends when the
+  // TrailerForwarder is invoked. An optional final body chunk may be passed.
   Coroutine::Task<TrailerForwarder> operator() (Buffer::InstancePtr data = nullptr) &&;
 };
 
@@ -350,17 +367,18 @@ public:
 
 class TerminatingActions {
 public:
-  // kicks off the local reply and encoder should be called. once a local reply
-  // is sent, `HeaderGetter` / `DataGenerator` / `TrailerGetter` will return
-  // error for a non-terminating filter. the filter should generally clean
-  // itself up and `co_return`. a terminating filter can keep receiving
-  // remainder of the messages.
-  void replyLocally(Http::Code code) &&;
+  // Starts the local reply. Once a local reply is sent, `HeaderGetter` /
+  // `DataGenerator` / `TrailerGetter` return an error for a non-terminating
+  // filter; the filter should clean itself up and `co_return` the returned
+  // action. A terminating filter can keep receiving the remainder of the
+  // messages. Returns `PostDecodeAction::kReset` so it can be `co_return`ed
+  // directly.
+  PostDecodeAction replyLocally(Http::Code code) &&;
 
-  // attempts to recreate the filter chain. once started (ok status)
-  // `HeaderGetter` / `DataGenerator` / `TrailerGetter` will return error. the
+  // Attempts to recreate the filter chain. Once it has started (ok status),
+  // `HeaderGetter` / `DataGenerator` / `TrailerGetter` return an error and the
   // filter should clean itself up.
-  absl::StaturOr recreateStream() &&;
+  absl::Status recreateStream() &&;
 
   // more overloads can be provided to provide ease of use.
 };
@@ -369,25 +387,93 @@ public:
 
 ## Decode encode communication
 
-In the case where the encode path (response) needs to get some infromation from
+In the case where the encode path (response) needs to get some information from
 the decode path (request), we take use of the Context object. In the wrapper
 filter, we provide a base class that provides `StreamInfo` and the likes. A
 filter can choose to implement a subclass of Context that provides additional
 methods or awaitable coroutines to pass information from decode path to encode
-path. A typical filter should content with synchronous setter and getter
-methods. In the rare case async behavior is needed, coroutine be be implemented.
+path. A typical filter should be content with synchronous setter and getter
+methods. In the rare case async behavior is needed, coroutines can be implemented.
 
 ## Coroutine life cycle
 
-To make memory management cleaner, a coroutine controls its full life cycle - it
-decides when to suspend and when to return. We don't destroy the coroutine even
-when the HTTP stream is reset. The coroutine learns that the stream is reset
-when it makes call to one of the getters, forwarders, and the terminating
-actions, which will always return error after the stream reset.
+The coroutine owns its own frame: it is only ever destroyed at `final_suspend`,
+never torn down mid-flight by the wrapper filter. This keeps memory management
+safe — no frame is freed while the coroutine is suspended or running — and it
+lets a coroutine outlive the HTTP stream when it needs to, to finish background
+work after the stream is gone.
 
-Note that the coroutine filter can still perform some final actions to clean up
-whatever state it wants to, but any of the actions, and context might be invalid
-at this point.
+Two signals drive the life cycle, and keeping them distinct matters:
+
+-   **Stream liveness** — whether the coroutine can still make progress on the
+    stream. It dies when the wrapper filter / stream is torn down.
+-   **Frame ownership** — who is responsible for destroying the frame once the
+    coroutine completes.
+
+### Reset: fail fast on stream operations, leave everything else
+
+When the stream is reset, only the awaits the coroutine issued to the stream
+infrastructure (`HeaderGetter` / `DataGenerator` / `DataForwarder` /
+`TrailerGetter` / `TerminatingActions`) are aborted. Once the stream is gone
+these awaitables fail fast — `await_ready()` returns `true` and the await resumes
+immediately with an abort status — so the coroutine never re-suspends on a stream
+operation. The next time its logic touches any stream op it gets the abort and
+unwinds through a normal `co_return`, running all destructors (and
+`absl::Cleanup`s), and awaiting further cleanup first if it wants to.
+
+We deliberately do **not** chase down other pending awaits (a file read, a
+timer). The coroutine rides those to their normal completion and then reaches a
+stream op, which aborts it. This is exactly what lets the same mechanism serve an
+intentional detach — a coroutine that wants to keep running after the stream is
+gone simply keeps awaiting non-stream operations and never touches the dead
+stream again — without any explicit `detach()` call.
+
+This rests on one contract: **every non-stream awaitable the coroutine can park
+on must eventually complete or be cancellable.** Bounded I/O and timers satisfy
+it. The trap is an awaitable whose producer died with the stream (for example, a
+decode↔encode `Context` primitive whose peer is gone) — it must supply its own
+completion/abort, or the coroutine parks forever.
+
+### Ownership and destruction
+
+Whether the wrapper filter (the parent) will destroy the frame is decided at
+`final_suspend`. The parent holds a `shared_ptr` ownership token; the coroutine
+holds a `weak_ptr` to it, and checks it at `final_suspend`:
+
+-   token still owned → `suspend_always`: the owner reads the `PostDecodeAction`
+    and calls `destroy()`.
+-   token gone → `suspend_never`: the frame destroys itself, because nobody is
+    left to read the result.
+
+When the wrapper filter is destroyed with the coroutine still pending, it does
+not destroy the coroutine — it **hands the task to the pending-task registry**,
+moving the ownership token with it. Because ownership is *transferred* rather than
+dropped, the `weak_ptr` stays valid throughout, so there is no window in which a
+coroutine reaches `final_suspend` with no one to free it. The registry is now the
+owner and destroys the frame when the coroutine completes.
+
+### The registry is a watchdog; the default is to crash
+
+The pending-task registry is primarily a **watchdog**, not a garbage collector.
+Every task it holds has a deadline. A task that overstays is a bug — a coroutine
+that forgot to terminate, or one parked on a non-completing await — and the
+**default action is to crash the process**, so newly introduced lifecycle bugs
+surface immediately in tests and canaries instead of leaking silently in
+production. (A softer action — force-`destroy()` plus a stat — can be selected
+where a crash is unacceptable; force-destroy runs only RAII cleanup, since the
+frame is destroyed while suspended.)
+
+The registry is also the observability and drain hook: it exports the count of
+in-flight detached tasks, e2e tests assert it drains to zero, and worker drain
+enumerates it to force-terminate anything still alive.
+
+### What a coroutine may touch after reset
+
+`Context` is always safe to call, though it may return an error. Every other
+action (getters, forwarders, terminating actions) returns an error once the
+stream is reset. Cleanup that must run on reset should therefore be expressed as
+RAII (destructors / `absl::Cleanup`), which run on the normal `co_return` unwind
+and may safely use `Context`.
 
 ## Re-entrancy
 
