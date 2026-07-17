@@ -81,7 +81,7 @@ Wouldn't it be nice if we can write the following code instead?
 
 ```c++
 HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder forward_headers,
-                   TerminatingActions terminating_actions, Context) {
+                   TerminatingActions terminating_actions, RequestInfo) {
   RequestHeaders headers;
   DataGenerator data_generator;
   ASSIGN_OR_CO_RETURN(std::tie(headers, data_generator),
@@ -141,7 +141,7 @@ We can also imagine simple filters really just read the headers and `co_return`:
 
 ```c++
 HttpDecoder decode(HeaderGetter get_headers, HeaderForwarder,
-                   TerminatingActions, Context) {
+                   TerminatingActions, RequestInfo) {
   RequestHeaders headers;
   ASSIGN_OR_CO_RETURN(
     std::tie(headers, std::ignore), co_await std::move(get_headers)());
@@ -221,13 +221,13 @@ PostDecodeAction::kSkip`.
 
 Obviously, we need access to `StreamInfo`, configuration, route tables, etc.
 These functionalities should be provided via synchronous function calls provided
-by `Context`.
+by `RequestInfo`.
 
 ## (Somewhat) symmetric response handling and coordination
 
 We can write response handling in a similar way, which brings the necessity of
 sharing state between `decode()` and `encode()`. This should be handled by
-`Context` providing some async message passing primitives.
+`RequestInfo` providing some async message passing primitives.
 
 ## Timeouts
 
@@ -397,9 +397,9 @@ public:
 ## Decode encode communication
 
 In the case where the encode path (response) needs to get some information from
-the decode path (request), we take use of the Context object. In the wrapper
+the decode path (request), we take use of the RequestInfo object. In the wrapper
 filter, we provide a base class that provides `StreamInfo` and the likes. A
-filter can choose to implement a subclass of Context that provides additional
+filter can choose to implement a subclass of RequestInfo that provides additional
 methods or awaitable coroutines to pass information from decode path to encode
 path. A typical filter should be content with synchronous setter and getter
 methods. In the rare case async behavior is needed, coroutines can be implemented.
@@ -408,16 +408,23 @@ methods. In the rare case async behavior is needed, coroutines can be implemente
 
 The coroutine owns its own frame: it is only ever destroyed at `final_suspend`,
 never torn down mid-flight by the wrapper filter. This keeps memory management
-safe — no frame is freed while the coroutine is suspended or running — and it
-lets a coroutine outlive the HTTP stream when it needs to, to finish background
-work after the stream is gone.
+safe — no frame is freed while the coroutine is suspended or running. This is
+chosen over silent destroy at suspention points `co_await` or `co_yield`. The
+reasoning aligns with the choice of not supporting exception in Envoy on the
+data plane.
 
-Two signals drive the life cycle, and keeping them distinct matters:
+This does call for advisory cancellation, meaning the outer most caller of a
+coroutine has to wait until the coroutine is done before it frees resources that
+might be used by the coroutines. In this case, it is the wrapper filter's job to
+kick off the cancellation during `onDestroy`. The current design makes it so
+that all stream operations transfer memory ownership to the coroutine. Other
+informational objects (stream info, etc) are passed as `shared_ptr`.
 
--   **Stream liveness** — whether the coroutine can still make progress on the
-    stream. It dies when the wrapper filter / stream is torn down.
--   **Frame ownership** — who is responsible for destroying the frame once the
-    coroutine completes.
+We want to have a watch dog to make sure the filters do eventually finish the
+clean-up.
+
+We propagate the cancellation all the way down to the leaf of the coroutine
+call. This achieves fail fast.
 
 ### Reset: fail fast on stream operations, leave everything else
 
@@ -430,61 +437,27 @@ operation. The next time its logic touches any stream op it gets the abort and
 unwinds through a normal `co_return`, running all destructors (and
 `absl::Cleanup`s), and awaiting further cleanup first if it wants to.
 
-We deliberately do **not** chase down other pending awaits (a file read, a
-timer). The coroutine rides those to their normal completion and then reaches a
-stream op, which aborts it. This is exactly what lets the same mechanism serve an
-intentional detach — a coroutine that wants to keep running after the stream is
-gone simply keeps awaiting non-stream operations and never touches the dead
-stream again — without any explicit `detach()` call.
-
-This rests on one contract: **every non-stream awaitable the coroutine can park
-on must eventually complete or be cancellable.** The default `Task` timeout (see
-Timeouts) normally satisfies it — an awaited operation aborts on its own after
-the timeout. The trap is an awaitable that escapes that default and whose
-producer died with the stream (for example, a decode↔encode `Context` primitive
-whose peer is gone) — it must supply its own completion/abort, or the coroutine
-parks forever.
+Normally, the cancellation is propagated for any new asynchronous call to make
+sure the unwind happens quickly. However, we can add support to suppress the
+cancellation for newly launched coroutines for clean-ups.
 
 ### Ownership and destruction
 
-Whether the wrapper filter (the parent) will destroy the frame is decided at
-`final_suspend`. The parent holds a `shared_ptr` ownership token; the coroutine
-holds a `weak_ptr` to it, and checks it at `final_suspend`:
+Caller always destruct a coroutine it calls.
 
--   token still owned → `suspend_always`: the owner reads the `PostDecodeAction`
-    and calls `destroy()`.
--   token gone → `suspend_never`: the frame destroys itself, because nobody is
-    left to read the result.
+### Watch dog 
 
-When the wrapper filter is destroyed with the coroutine still pending, it does
-not destroy the coroutine — it **hands the task to the pending-task registry**,
-moving the ownership token with it. Because ownership is *transferred* rather than
-dropped, the `weak_ptr` stays valid throughout, so there is no window in which a
-coroutine reaches `final_suspend` with no one to free it. The registry is now the
-owner and destroys the frame when the coroutine completes.
-
-### The registry is a watchdog; the default is to crash
-
-The pending-task registry is primarily a **watchdog**, not a garbage collector.
-Every task it holds has a deadline. A task that overstays is a bug — a coroutine
-that forgot to terminate, or one parked on a non-completing await — and the
-**default action is to crash the process**, so newly introduced lifecycle bugs
-surface immediately in tests and canaries instead of leaking silently in
-production. (A softer action — force-`destroy()` plus a stat — can be selected
-where a crash is unacceptable; force-destroy runs only RAII cleanup, since the
-frame is destroyed while suspended.)
-
-The registry is also the observability and drain hook: it exports the count of
-in-flight detached tasks, e2e tests assert it drains to zero, and worker drain
-enumerates it to force-terminate anything still alive.
+We need a watch dog to export pending cancellation coroutine filters to make
+sure they eventually finish. Normally, the filters finish fast by completion
+token.
 
 ### What a coroutine may touch after reset
 
-`Context` is always safe to call, though it may return an error. Every other
+`RequestInfo` is always safe to call, though it may return an error. Every other
 action (getters, forwarders, terminating actions) returns an error once the
 stream is reset. Cleanup that must run on reset should therefore be expressed as
 RAII (destructors / `absl::Cleanup`), which run on the normal `co_return` unwind
-and may safely use `Context`.
+and may safely use `RequestInfo`.
 
 ## Static analysis & memory safety enforcements
 
