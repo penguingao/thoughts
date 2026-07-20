@@ -13,15 +13,23 @@ In scope (this plan):
 - `CoroutineContext`: carries the executor and a `CancellationState`, propagated
   down the `co_await` chain through the promise.
 - `Task<T>` / `Task<void>`: lazy, move-only, no-exceptions, symmetric-transfer
-  continuation, context propagation, per-leaf default timeout.
+  continuation, context propagation.
 - `LeafAwaitable<T>`: base class for bridging callback/OS events into a
-  cancellable, timeout-bounded awaitable.
+  **cancellable** awaitable, plus `TimerAwaitable` (`sleep`) as the concrete
+  example leaf.
 - Root launch: `launch()` + `DetachedHandle` for starting a coroutine from
   non-coroutine code and getting a completion callback, with `cancel()`.
 
 Deferred (must remain addable — see [Extension seams](#extension-seams)):
-- Structured concurrency: `any_of`, `all_of`, and `with_timeout()` over an
-  arbitrary sub-tree (timeout modeled as `any_of(task, timeout)`).
+- Timeout, in all forms. Neither per-leaf default timeout nor `with_timeout()`
+  ships in core, because timeout is a policy applied *over* an awaitable, not a
+  property of a leaf (see [Timeout](#timeout-is-a-leaf-not-a-base-class-feature)).
+  Core liveness rests on **cancellation** instead — the wrapper filter cancels on
+  teardown and stream ops fail fast on reset — which is the mechanism that
+  actually unwinds a stalled coroutine. The default-timeout net (a
+  `TimerAwaitable`-based leaf race in `await_transform`) and `with_timeout()` over
+  a sub-tree (`any_of(task, timer)`) land with the structured-concurrency work.
+- Structured concurrency: `any_of`, `all_of`.
 - Cross-thread hops and foreign executors.
 - `PendingTaskRegistry` adopt-on-destroy (core provides the `DetachedHandle` it
   will hold; the registry container itself is layered on top).
@@ -36,8 +44,11 @@ Deferred (must remain addable — see [Extension seams](#extension-seams)):
   which the body propagates to a normal `co_return`.
 - A coroutine frame is destroyed only at `final_suspend`, never torn down
   mid-flight. The awaiting caller destroys the child ("caller always destructs").
-- Every leaf awaitable is cancellable and timeout-bounded, so no `co_await` hangs
-  indefinitely.
+- Every leaf awaitable is **cancellable**, so a stalled `co_await` can always be
+  unwound by cancelling it. (Timeout — automatically cancelling a leaf after a
+  deadline — is a policy layered on top of cancellation and is deferred; see
+  Scope. In core, the cancel trigger is the wrapper filter / stream reset, not a
+  timer.)
 
 # Components
 
@@ -58,7 +69,8 @@ public:
   // cross-thread hopping possible later without changing callers.
   virtual void schedule(std::coroutine_handle<> handle) = 0;
 
-  // Timer creation for leaf timeouts. Returns an Envoy TimerPtr.
+  // Timer creation (used by TimerAwaitable / sleep, and later the timeout
+  // policy). Returns an Envoy TimerPtr.
   virtual Event::TimerPtr createTimer(std::function<void()> cb) = 0;
 };
 ```
@@ -98,11 +110,11 @@ class CoroutineContext {
 public:
   Executor& executor() const { return *executor_; }
   const std::shared_ptr<CancellationState>& cancellation() const { return cancel_; }
-  std::chrono::milliseconds defaultTimeout() const { return default_timeout_; }
+  // Note: no default-timeout field in core. The timeout policy (deferred) adds
+  // its deadline input here when it lands.
 private:
   Executor* executor_;                          // borrowed; long-lived
   std::shared_ptr<CancellationState> cancel_;   // per-scope (see seams)
-  std::chrono::milliseconds default_timeout_;
 };
 ```
 
@@ -246,11 +258,6 @@ public:
     return result_ ? std::move(*result_) : abortStatus(Cancelled);   // fail-fast path
   }
 
-  // Whether the timeout policy should bound this leaf by default. Long-lived
-  // stream/forwarding leaves override to false; they are bounded by the wrapper
-  // filter's watchdog / stream reset instead of a finite timer.
-  static constexpr bool kBounded = true;
-
 protected:
   // Derived implements these:
   virtual void onStart() = 0;    // launch the op; arrange to call complete(value)
@@ -297,14 +304,31 @@ private:
 The leaf needs the context, and `await_suspend(coroutine_handle<>)` erases the
 promise type. **Decision: inject via `await_transform` on the promise** — it is
 the one choke point where the promise sees every awaitable, so it can hand each
-leaf/child its `context_`, *reject* `co_await` on anything that is not a `Task` or
-`LeafAwaitable` (a requirement from [20260716_CORO_LIB.md]), *and* apply the
-default-timeout policy below. The full transform is shown in the next section.
+leaf/child its `context_` and *reject* `co_await` on anything that is not a `Task`
+or `LeafAwaitable` (a requirement from [20260716_CORO_LIB.md]). That is all the
+core transform does:
 
-### Timeout is a leaf, not a base-class feature
+```c++
+template <typename T> struct TaskPromise : PromiseBase {
+  template <typename A> decltype(auto) await_transform(A&& a) {
+    static_assert(IsTaskOrLeafAwaitable<A>, "co_await only Task or LeafAwaitable");
+    a.injectContext(context_);          // hand the leaf/child its context
+    return std::forward<A>(a);
+  }
+};
+```
+
+`await_transform` is also the seam where the deferred timeout policy plugs in
+(see below) — it is already the point that sees every awaitable, so it is where a
+future default-timeout wrap goes, with no change to `Task` or the base leaf.
+
+### Timeout is a leaf, not a base-class feature (deferred)
+
+**Deferred — not built in core** (see Scope). Recorded here because it is the
+design the timeout seam commits to, and it is why the base leaf owns no timer.
 
 Timeout is applied *around* a leaf by racing it against a `TimerAwaitable`. Two
-facts make this cheap and keep it out of the core "no structured concurrency" ban:
+facts make this cheap and keep it out of the "no structured concurrency" core:
 
 - **Bounding every leaf bounds every chain.** A `Task` only ever suspends by
   ultimately awaiting a leaf, so if every bounded leaf has a timer racing it, no
@@ -316,32 +340,23 @@ facts make this cheap and keep it out of the core "no structured concurrency" ba
   bigger problem. When it lands, `with_timeout(task)` over a sub-tree becomes
   `any_of(task, TimerAwaitable)`, and this leaf race is its degenerate fast path.
 
-"Bounded by default" is applied in one place — the promise's `await_transform`,
-which is already where context is injected and non-awaitables are rejected. When
-it transforms a leaf whose `kBounded` is true, it wraps it in the leaf race with
-`context_->defaultTimeout()` (or a `with_timeout(leaf, d)` override); a leaf with
-`kBounded == false` (stream forwarding) is returned unwrapped. This preserves
-"bounded unless explicitly opted out" while keeping timers entirely inside
-`TimerAwaitable`.
+When built, "bounded by default" goes in the one place already central — the
+promise's `await_transform`. It gains a branch that, for a leaf marked bounded
+(a re-introduced `kBounded` trait; long-lived stream/forwarding leaves set it
+false), wraps the leaf in the race with a deadline (the context default or a
+`with_timeout(leaf, d)` override); other awaitables pass through unwrapped:
 
 ```c++
-template <typename T> struct TaskPromise : PromiseBase {
-  template <typename A> decltype(auto) await_transform(A&& a) {
-    static_assert(IsTaskOrLeafAwaitable<A>, "co_await only Task or LeafAwaitable");
-    a.injectContext(context_);
     if constexpr (IsLeaf<A> && A::kBounded) {
-      return raceWithTimer(std::forward<A>(a), context_->defaultTimeout()); // leaf race
-    } else {
-      return std::forward<A>(a);   // Task, or opted-out unbounded leaf
+      return raceWithTimer(std::forward<A>(a), deadlineFor(a)); // leaf race (deferred)
     }
-  }
-};
+    return std::forward<A>(a);
 ```
 
 The leaf race itself (`raceWithTimer` → a small `TimedLeaf<A>` awaiter) holds the
 wrapped leaf and a `TimerAwaitable` by value, arms both, and on the first
 `finish()` cancels the other. It owns no timer directly — the `TimerAwaitable`
-sub-object does. Full `with_timeout()` over a **Task sub-tree** stays deferred to
+sub-object does. `with_timeout()` over a **Task sub-tree** stays deferred to
 structured concurrency.
 
 ## 5. Root launch + `DetachedHandle`
@@ -352,10 +367,9 @@ task in a tiny root coroutine that awaits it and invokes the callback:
 ```c++
 template <typename T>
 DetachedHandle launch(Task<T> task, Executor& exec,
-                      absl::AnyInvocable<void(T)> on_done,
-                      std::chrono::milliseconds default_timeout) {
+                      absl::AnyInvocable<void(T)> on_done) {
   auto ctx = std::make_shared<CoroutineContext>(
-      &exec, std::make_shared<CancellationState>(), default_timeout);
+      &exec, std::make_shared<CancellationState>());
   RootTask root = runRoot(std::move(task), std::move(on_done));   // see below
   root.promise().context_ = ctx;
   DetachedHandle handle(root.release());     // owns the frame
@@ -410,7 +424,6 @@ classDiagram
     class CoroutineContext {
         -executor_ : Executor*
         -cancel_ : shared_ptr CancellationState
-        -default_timeout_
     }
     class CancellationState {
         -cancelled_ : bool
@@ -453,7 +466,7 @@ classDiagram
         -timer_ : TimerPtr
     }
     class TimedLeaf {
-        <<template A>>
+        <<deferred>>
         -leaf_ : A
         -timer_ : TimerAwaitable
     }
@@ -506,9 +519,9 @@ The frame-ownership spine (the thing to get right):
   thread. This is the field that would become `shared_ptr<Executor>` when foreign
   executors with independent lifetimes arrive (see seams).
 - The `Event::Timer` is owned only by `TimerAwaitable` (never the base leaf), and
-  destroyed the instant that leaf finishes, which disarms it. A default-timeout
-  race holds its `TimerAwaitable` by value inside a `TimedLeaf`, so the timer's
-  lifetime is bounded by the await it guards.
+  destroyed the instant that leaf finishes, which disarms it. (When the deferred
+  timeout race ships, a `TimedLeaf` holds its `TimerAwaitable` by value, so the
+  timer's lifetime is bounded by the await it guards — still never the base leaf.)
 - `CancellationState::on_cancel_` borrows the *current* pending leaf via a captured
   `this`. It is cleared in the leaf's one-shot `finish()`, so it can never outlive
   the leaf it points at.
@@ -526,8 +539,10 @@ The frame-ownership spine (the thing to get right):
   copies the parent context). Swap "inherit as-is" for "derive child scope" there.
 - `Task` is already move-only with an rvalue `operator co_await`, so
   `any_of(std::move(t1), std::move(t2))` needs no change to `Task`.
-- `with_timeout(task)` becomes `any_of(task, timeoutTask())` once combinators
-  exist; per-leaf timeout stays as the always-on backstop.
+- Timeout lands with this work (it is deferred out of core — see Scope): the
+  per-leaf default-timeout race and `with_timeout(task)` = `any_of(task, timer)`
+  arrive together, since both are policies over awaitables rather than leaf
+  properties.
 
 **Thread hopping / foreign executors.** This is *why* the executor lives in the
 context, not just on the leaf. Because the context carries the executor and is
@@ -566,15 +581,14 @@ executor is a scheduler-shaped interface, so aliasing toward
    awaiter, context propagation, move-only, `unhandled_exception` → panic. Tests:
    value/void return, N-deep chaining propagates context, destroying an unstarted
    task is safe.
-4. **LeafAwaitable + TimerAwaitable + timeout**: timer-free base (fail-fast,
-   one-shot `finish`, cancel registration); `TimerAwaitable` as the one
-   timer-owning concrete leaf (also `sleep`); `await_transform` doing context
-   injection + `co_await` type-restriction static_assert + wrapping bounded leaves
-   in the `TimedLeaf` race with the context default. Tests: leaf completes; leaf
-   times out via the race; `kBounded == false` leaf is never wrapped; cancelled
-   while pending fires `onCancel` and unwinds; cancelled between awaits fails fast
-   on next await; complete/cancel race resolves once; timer-vs-leaf race cancels
-   the loser exactly once.
+4. **LeafAwaitable + TimerAwaitable**: timer-free base (fail-fast, one-shot
+   `finish`, cancel registration); `TimerAwaitable` as the concrete leaf (also
+   `sleep`, and the natural test leaf); `await_transform` doing context injection
+   + `co_await` type-restriction static_assert (no timeout wrapping in core).
+   Tests: leaf completes; cancelled while pending fires `onCancel` and unwinds;
+   cancelled between awaits fails fast on next await; complete/cancel race
+   resolves once. (Timeout race + default-timeout wrapping are a later milestone,
+   with structured concurrency — see Scope.)
 5. **launch + DetachedHandle**: root wrapper, completion callback, `cancel()`,
    done flag. Tests: end-to-end launch → leaf → callback; cancel mid-flight
    unwinds through destructors and still calls back.
