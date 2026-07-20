@@ -21,15 +21,8 @@ In scope (this plan):
   non-coroutine code and getting a completion callback, with `cancel()`.
 
 Deferred (must remain addable — see [Extension seams](#extension-seams)):
-- Timeout, in all forms. Neither per-leaf default timeout nor `with_timeout()`
-  ships in core, because timeout is a policy applied *over* an awaitable, not a
-  property of a leaf (see [Timeout](#timeout-is-a-leaf-not-a-base-class-feature)).
-  Core liveness rests on **cancellation** instead — the wrapper filter cancels on
-  teardown and stream ops fail fast on reset — which is the mechanism that
-  actually unwinds a stalled coroutine. The default-timeout net (a
-  `TimerAwaitable`-based leaf race in `await_transform`) and `with_timeout()` over
-  a sub-tree (`any_of(task, timer)`) land with the structured-concurrency work.
 - Structured concurrency: `any_of`, `all_of`.
+- Timeout on tasks and leaf awaitables. Added when structured concurrency is.
 - Cross-thread hops and foreign executors.
 - `PendingTaskRegistry` adopt-on-destroy (core provides the `DetachedHandle` it
   will hold; the registry container itself is layered on top).
