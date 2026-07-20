@@ -298,22 +298,47 @@ The leaf needs the context, and `await_suspend(coroutine_handle<>)` erases the
 promise type. **Decision: inject via `await_transform` on the promise** — it is
 the one choke point where the promise sees every awaitable, so it can hand each
 leaf/child its `context_` and *reject* `co_await` on anything that is not a `Task`
-or `LeafAwaitable` (a requirement from [20260716_CORO_LIB.md]). That is all the
-core transform does:
+or `LeafAwaitable` (a requirement from [20260716_CORO_LIB.md]). Because the promise
+defines `await_transform`, the compiler routes *every* `co_await` in the body
+through it and never falls back to the raw awaitable — so a disallowed await is a
+hard error regardless of how we gate it.
+
+We gate with **C++20 concepts** rather than a bare `static_assert`, because
+`await_transform` grows more awaitable families as the deferred work lands (Leaf
+gets a timeout-race wrap that Task does not; `on(exec, task)` and
+`with_timeout(...)` wrappers each want their own handling), and concept-constrained
+overloads express that divergence far better than a growing `if constexpr` chain.
+The same concepts are reused to constrain `launch()` and the future combinators,
+giving one vocabulary and consistent errors across the library.
 
 ```c++
+// Reusable predicates (IsTask via a tag/base, LeafAwaitable via base).
+template <class A> using bare = std::remove_cvref_t<A>;   // forwarding-ref strip
+template <class A> concept TaskAwaitable = IsTask<bare<A>>;
+template <class A> concept LeafAwaitable_ = std::derived_from<bare<A>, LeafAwaitableTag>;
+template <class A> concept CoroAwaitable  = TaskAwaitable<A> || LeafAwaitable_<A>;
+
 template <typename T> struct TaskPromise : PromiseBase {
-  template <typename A> decltype(auto) await_transform(A&& a) {
-    static_assert(IsTaskOrLeafAwaitable<A>, "co_await only Task or LeafAwaitable");
+  // One handler in core (Task and Leaf are treated identically for now).
+  template <CoroAwaitable A> decltype(auto) await_transform(A&& a) {
     a.injectContext(context_);          // hand the leaf/child its context
     return std::forward<A>(a);
+  }
+  // Unconstrained fallback: fires only when no constrained overload matches, so
+  // disallowed awaits get a crisp message instead of "no viable overload".
+  // (dependent_false because a bare static_assert(false) in a template is ill-formed.)
+  template <class A> decltype(auto) await_transform(A&&) {
+    static_assert(dependent_false<A>, "co_await only Task or LeafAwaitable");
   }
 };
 ```
 
-`await_transform` is also the seam where the deferred timeout policy plugs in
-(see below) — it is already the point that sees every awaitable, so it is where a
-future default-timeout wrap goes, with no change to `Task` or the base leaf.
+This **hybrid** — constrained overload(s) for dispatch plus an unconstrained
+`static_assert` fallback for the message — keeps the good diagnostic while readying
+overload-based dispatch. When Leaf and Task handling diverge (the timeout wrap),
+the single `CoroAwaitable` handler splits into `TaskAwaitable` and `LeafAwaitable_`
+overloads with no change to `Task` or the base leaf; that is the seam the deferred
+timeout policy plugs into (below).
 
 ### Timeout is a leaf, not a base-class feature (deferred)
 
@@ -334,16 +359,22 @@ facts make this cheap and keep it out of the "no structured concurrency" core:
   `any_of(task, TimerAwaitable)`, and this leaf race is its degenerate fast path.
 
 When built, "bounded by default" goes in the one place already central — the
-promise's `await_transform`. It gains a branch that, for a leaf marked bounded
-(a re-introduced `kBounded` trait; long-lived stream/forwarding leaves set it
-false), wraps the leaf in the race with a deadline (the context default or a
-`with_timeout(leaf, d)` override); other awaitables pass through unwrapped:
+promise's `await_transform`. The single `CoroAwaitable` handler splits: `Task`
+awaitables keep the pass-through overload, while the `LeafAwaitable_` overload
+wraps a leaf marked bounded (a re-introduced `kBounded` trait; long-lived
+stream/forwarding leaves set it false) in the race with a deadline (the context
+default or a `with_timeout(leaf, d)` override). No `if constexpr` chain, and no
+change to `Task` or the base leaf:
 
 ```c++
-    if constexpr (IsLeaf<A> && A::kBounded) {
-      return raceWithTimer(std::forward<A>(a), deadlineFor(a)); // leaf race (deferred)
-    }
-    return std::forward<A>(a);
+  // added overload (Task overload unchanged)
+  template <LeafAwaitable_ A> decltype(auto) await_transform(A&& a) {
+    a.injectContext(context_);
+    if constexpr (A::kBounded)
+      return raceWithTimer(std::forward<A>(a), deadlineFor(a));  // leaf race (deferred)
+    else
+      return std::forward<A>(a);                                 // opted-out leaf
+  }
 ```
 
 The leaf race itself (`raceWithTimer` → a small `TimedLeaf<A>` awaiter) holds the
@@ -576,11 +607,13 @@ executor is a scheduler-shaped interface, so aliasing toward
    task is safe.
 4. **LeafAwaitable + TimerAwaitable**: timer-free base (fail-fast, one-shot
    `finish`, cancel registration); `TimerAwaitable` as the concrete leaf (also
-   `sleep`, and the natural test leaf); `await_transform` doing context injection
-   + `co_await` type-restriction static_assert (no timeout wrapping in core).
-   Tests: leaf completes; cancelled while pending fires `onCancel` and unwinds;
-   cancelled between awaits fails fast on next await; complete/cancel race
-   resolves once. (Timeout race + default-timeout wrapping are a later milestone,
+   `sleep`, and the natural test leaf); the `Task`/`Leaf`/`CoroAwaitable` concepts;
+   `await_transform` doing context injection + `co_await` type-restriction via the
+   `CoroAwaitable`-constrained overload plus the `static_assert` fallback (no
+   timeout wrapping in core). Tests: leaf completes; cancelled while pending fires
+   `onCancel` and unwinds; cancelled between awaits fails fast on next await;
+   complete/cancel race resolves once; a disallowed `co_await` gives the fallback
+   diagnostic. (Timeout race + default-timeout wrapping are a later milestone,
    with structured concurrency — see Scope.)
 5. **launch + DetachedHandle**: root wrapper, completion callback, `cancel()`,
    done flag. Tests: end-to-end launch → leaf → callback; cancel mid-flight
@@ -610,5 +643,7 @@ executor is a scheduler-shaped interface, so aliasing toward
 - **Context ownership cost**: `shared_ptr<CoroutineContext>` per await is simplest
   and safe; measure before optimizing to a borrowed pointer with root-owned
   lifetime.
-- **`co_await` restriction mechanism**: `await_transform` static_assert is the
-  plan; confirm it composes with the leaf context injection cleanly.
+- **`co_await` restriction mechanism**: concept-constrained `await_transform`
+  overloads + a `static_assert` fallback is the plan; confirm the `IsTask` /
+  `LeafAwaitableTag` detection predicates and the forwarding-ref `bare<A>` strip
+  compose with the leaf context injection cleanly.
