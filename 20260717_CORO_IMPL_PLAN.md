@@ -223,8 +223,10 @@ any change to `Task`.
 ## 4. `LeafAwaitable<T>` — the callback/OS bridge
 
 The base class every leaf (timer wait, eventfd, c-ares, openssl callback, a
-stream operation) derives from. It provides: fail-fast when pre-cancelled,
-one-shot completion, cancellation registration, and a default timeout.
+stream operation) derives from. Its job is exactly three things — **fail-fast
+when pre-cancelled, one-shot completion, and cancellation registration**. It does
+**not** own a timer or implement timeout: timeout is a policy applied *around* a
+leaf, not baked into every leaf (see [Timeout](#timeout-is-a-leaf-not-a-base-class-feature)).
 
 ```c++
 template <typename T>
@@ -235,9 +237,6 @@ public:
 
   void await_suspend(std::coroutine_handle<> h) {
     continuation_ = h;
-    // arm timeout
-    timer_ = context_->executor().createTimer([this]{ finish(abortStatus(TimedOut)); });
-    timer_->enableTimer(timeout_);
     // register cancellation
     context_->cancellation()->setCancelCallback([this]{ onCancel(); finish(abortStatus(Cancelled)); });
     onStart();   // derived kicks off the async op; must eventually call complete()
@@ -246,6 +245,11 @@ public:
   T await_resume() {
     return result_ ? std::move(*result_) : abortStatus(Cancelled);   // fail-fast path
   }
+
+  // Whether the timeout policy should bound this leaf by default. Long-lived
+  // stream/forwarding leaves override to false; they are bounded by the wrapper
+  // filter's watchdog / stream reset instead of a finite timer.
+  static constexpr bool kBounded = true;
 
 protected:
   // Derived implements these:
@@ -257,9 +261,8 @@ protected:
 
 private:
   void finish(T value) {
-    if (finished_) return;          // one-shot: cancel/timeout/complete race → first wins
+    if (finished_) return;          // one-shot: cancel/complete race → first wins
     finished_ = true;
-    timer_.reset();
     context_->cancellation()->clearCancelCallback();
     result_ = std::move(value);
     if (continuation_) continuation_.resume();   // inline resume at event-loop boundary
@@ -267,37 +270,79 @@ private:
   bool finished_ = false;
   std::optional<T> result_;
   std::coroutine_handle<> continuation_{};
-  Event::TimerPtr timer_;
   std::shared_ptr<CoroutineContext> context_;   // captured from the awaiting promise
-  std::chrono::milliseconds timeout_;
 };
 ```
 
-The leaf needs the context. Simplest wiring: `await_ready`/`await_suspend` obtain
-it from the awaiting promise. Since `await_suspend(coroutine_handle<>)` erases the
-promise type, we either (a) make `LeafAwaitable::await_suspend` templated on the
-parent promise like `TaskAwaiter`, or (b) have `Task`'s promise expose a
-`transform_awaiter` (via `await_transform`) that injects `context_` into any
-`LeafAwaitable` before returning it. **Decision: use `await_transform` on the
-promise** — it also gives us the enforcement point to *reject* `co_await` on
-anything that is not a `Task` or a `LeafAwaitable` (a requirement from
-[20260716_CORO_LIB.md]).
+`TimerAwaitable` is just a concrete leaf that owns the one `Event::TimerPtr` and
+`complete()`s when it fires — it is the *only* type that touches a timer, and it
+doubles as `sleep(d)`:
+
+```c++
+class TimerAwaitable : public LeafAwaitable<absl::Status> {
+public:
+  explicit TimerAwaitable(std::chrono::milliseconds d) : d_(d) {}
+protected:
+  void onStart() override {
+    timer_ = context().executor().createTimer([this]{ complete(absl::OkStatus()); });
+    timer_->enableTimer(d_);
+  }
+  void onCancel() override { timer_.reset(); }
+private:
+  Event::TimerPtr timer_;
+  std::chrono::milliseconds d_;
+};
+```
+
+The leaf needs the context, and `await_suspend(coroutine_handle<>)` erases the
+promise type. **Decision: inject via `await_transform` on the promise** — it is
+the one choke point where the promise sees every awaitable, so it can hand each
+leaf/child its `context_`, *reject* `co_await` on anything that is not a `Task` or
+`LeafAwaitable` (a requirement from [20260716_CORO_LIB.md]), *and* apply the
+default-timeout policy below. The full transform is shown in the next section.
+
+### Timeout is a leaf, not a base-class feature
+
+Timeout is applied *around* a leaf by racing it against a `TimerAwaitable`. Two
+facts make this cheap and keep it out of the core "no structured concurrency" ban:
+
+- **Bounding every leaf bounds every chain.** A `Task` only ever suspends by
+  ultimately awaiting a leaf, so if every bounded leaf has a timer racing it, no
+  chain can hang by accident — without any Task-level machinery.
+- **A leaf race is not `any_of`.** It races two *leaves* (the real op and a
+  `TimerAwaitable`), which have no coroutine frames: cancellation is synchronous
+  and there is nothing to unwind to `final_suspend`. The deferred general `any_of`
+  races arbitrary *Tasks* and must cancel-and-await their frames — a strictly
+  bigger problem. When it lands, `with_timeout(task)` over a sub-tree becomes
+  `any_of(task, TimerAwaitable)`, and this leaf race is its degenerate fast path.
+
+"Bounded by default" is applied in one place — the promise's `await_transform`,
+which is already where context is injected and non-awaitables are rejected. When
+it transforms a leaf whose `kBounded` is true, it wraps it in the leaf race with
+`context_->defaultTimeout()` (or a `with_timeout(leaf, d)` override); a leaf with
+`kBounded == false` (stream forwarding) is returned unwrapped. This preserves
+"bounded unless explicitly opted out" while keeping timers entirely inside
+`TimerAwaitable`.
 
 ```c++
 template <typename T> struct TaskPromise : PromiseBase {
   template <typename A> decltype(auto) await_transform(A&& a) {
     static_assert(IsTaskOrLeafAwaitable<A>, "co_await only Task or LeafAwaitable");
-    a.injectContext(context_);   // hand the leaf/child its context
-    return std::forward<A>(a);
+    a.injectContext(context_);
+    if constexpr (IsLeaf<A> && A::kBounded) {
+      return raceWithTimer(std::forward<A>(a), context_->defaultTimeout()); // leaf race
+    } else {
+      return std::forward<A>(a);   // Task, or opted-out unbounded leaf
+    }
   }
 };
 ```
 
-Per-await timeout override (`with_timeout(leaf, d)`) just sets `timeout_` before
-the await; the default comes from `context_->defaultTimeout()`. Full
-`with_timeout()` over an arbitrary **Task sub-tree** is deferred (it is
-`any_of(task, timeout)`); v1 timeout is per-leaf, which is the safety net the
-docs rely on.
+The leaf race itself (`raceWithTimer` → a small `TimedLeaf<A>` awaiter) holds the
+wrapped leaf and a `TimerAwaitable` by value, arms both, and on the first
+`finish()` cancels the other. It owns no timer directly — the `TimerAwaitable`
+sub-object does. Full `with_timeout()` over a **Task sub-tree** stays deferred to
+structured concurrency.
 
 ## 5. Root launch + `DetachedHandle`
 
@@ -402,14 +447,24 @@ classDiagram
         <<template T>>
         -context_ : shared_ptr CoroutineContext
         -continuation_ : handle
-        -timer_ : TimerPtr
         -result_ : optional T
+    }
+    class TimerAwaitable {
+        -timer_ : TimerPtr
+    }
+    class TimedLeaf {
+        <<template A>>
+        -leaf_ : A
+        -timer_ : TimerAwaitable
     }
     class Timer {
         <<Envoy>>
     }
+    LeafAwaitable <|-- TimerAwaitable
     LeafAwaitable o-- CoroutineContext : shared_ptr — OWNS
-    LeafAwaitable *-- Timer : TimerPtr — OWNS
+    TimerAwaitable *-- Timer : TimerPtr — OWNS
+    TimedLeaf *-- LeafAwaitable : leaf_ by value — OWNS
+    TimedLeaf *-- TimerAwaitable : by value — OWNS
     LeafAwaitable ..> PromiseBase : continuation_ — borrows suspended frame
     CancellationState ..> LeafAwaitable : on_cancel_ (captured this) — borrows
 
@@ -450,8 +505,10 @@ The frame-ownership spine (the thing to get right):
 - `Executor` is borrowed (raw ptr) — a `Dispatcher` outlives every request on its
   thread. This is the field that would become `shared_ptr<Executor>` when foreign
   executors with independent lifetimes arrive (see seams).
-- The `Event::Timer` is owned by the `LeafAwaitable`; it is destroyed the instant
-  the leaf finishes (complete / timeout / cancel), which disarms it.
+- The `Event::Timer` is owned only by `TimerAwaitable` (never the base leaf), and
+  destroyed the instant that leaf finishes, which disarms it. A default-timeout
+  race holds its `TimerAwaitable` by value inside a `TimedLeaf`, so the timer's
+  lifetime is bounded by the await it guards.
 - `CancellationState::on_cancel_` borrows the *current* pending leaf via a captured
   `this`. It is cleared in the leaf's one-shot `finish()`, so it can never outlive
   the leaf it points at.
@@ -509,12 +566,15 @@ executor is a scheduler-shaped interface, so aliasing toward
    awaiter, context propagation, move-only, `unhandled_exception` → panic. Tests:
    value/void return, N-deep chaining propagates context, destroying an unstarted
    task is safe.
-4. **LeafAwaitable**: base + one concrete leaf (a `sleep`/timer await is the
-   simplest real leaf), `await_transform` context injection + `co_await`
-   type-restriction static_assert, one-shot `finish`, cancel registration,
-   default + override timeout, fail-fast `await_ready`. Tests: completes; times
-   out; cancelled while pending fires `onCancel` and unwinds; cancelled between
-   awaits fails fast on next await; complete/timeout/cancel race resolves once.
+4. **LeafAwaitable + TimerAwaitable + timeout**: timer-free base (fail-fast,
+   one-shot `finish`, cancel registration); `TimerAwaitable` as the one
+   timer-owning concrete leaf (also `sleep`); `await_transform` doing context
+   injection + `co_await` type-restriction static_assert + wrapping bounded leaves
+   in the `TimedLeaf` race with the context default. Tests: leaf completes; leaf
+   times out via the race; `kBounded == false` leaf is never wrapped; cancelled
+   while pending fires `onCancel` and unwinds; cancelled between awaits fails fast
+   on next await; complete/cancel race resolves once; timer-vs-leaf race cancels
+   the loser exactly once.
 5. **launch + DetachedHandle**: root wrapper, completion callback, `cancel()`,
    done flag. Tests: end-to-end launch → leaf → callback; cancel mid-flight
    unwinds through destructors and still calls back.
