@@ -90,40 +90,60 @@ cancel other pending pushers. We need to make sure those cancellations don't
 mess up the loop that processing waiters runs. The safest is to just tombstone
 the cancelled waiters.
 
-# Pseudo code
+# C++ API Blueprint
 
 ```C++
-
-class Capacity {
+// Weighted async semaphore managing global capacity.
+class Semaphore : public std::enable_shared_from_this<Semaphore> {
 public:
-  // If blocked, put the waiters in FIFO.
-  //
-  // CapacityReleaser should be able to call a private release() method of
-  // Capacity, which releases the acquired capacity. release() should schedule
-  // a next iteration call to process the waiters.
-  CapacityAwaitable<absl::StatusOr<CapacityReleaser>> acquire(uint64_t size);
-  // Non-blocker version. Can be used to implement CapacityAwaitable during
-  // await_ready to optimistically insert to queue without coroutine overhead.
-  std::optional<CapacityReleaser> tryAcquire(uint64_t size);
+  explicit Semaphore(std::optional<uint64_t> max_permits = std::nullopt);
+
+  // Synchronous non-blocking acquisition attempt.
+  std::optional<SemaphoreReservation> tryAcquire(uint64_t permits = 1);
+
+  // Asynchronous FIFO acquisition awaitable.
+  SemaphoreAwaitable acquire(uint64_t permits = 1);
+
+  std::optional<uint64_t> maxPermits() const;
+  uint64_t currentPermits() const;
+
+private:
+  friend class SemaphoreReservation;
+  void release(uint64_t permits); // RAII-only via SemaphoreReservation
 };
+
+using Capacity = Semaphore;
+using CapacityReservation = SemaphoreReservation;
 
 template <typename T, typename SizeFunc = DefaultItemSize<T>>
-class Queue {
+class AsyncQueue {
 public:
-  // might directly resume a pop() waiter if there is one waiting. otherwise,
-  // try to acquire capacity.
-  push();
-  // non-blocker version.
-  tryPush();
+  explicit AsyncQueue(CapacityPtr capacity = nullptr, SizeFunc size_func = SizeFunc());
 
-  // blocks if no data. directly return if data is already there. in the latter
-  // case, releasing the capacity would cause capacity to process push waiters
-  // in the next iteration.
-  pop();
-  tryPop();
+  AsyncQueue(AsyncQueue&&) noexcept;
+  AsyncQueue& operator=(AsyncQueue&&) noexcept;
+  AsyncQueue(const AsyncQueue&) = delete;
+  AsyncQueue& operator=(const AsyncQueue&) = delete;
 
-  // signal eof - never blocks.
-  close();
+  // Non-owning accessor for producers holding weak_ptr<Core>.
+  PushAccessor pushAccessor() const;
+
+  // Direct handoff to waiting popper if available; otherwise acquires capacity and queues item.
+  Task<absl::Status> push(T item);
+  template <typename U = T> bool tryPush(U&& item);
+
+  // Directly reads off queue or suspends until data is pushed. Releases capacity on completion.
+  // Returns std::nullopt when queue is closed (EOF).
+  Task<absl::StatusOr<std::optional<T>>> pop();
+  std::optional<T> tryPop();
+
+  // Signals EOF to poppers and closes the queue (never blocks).
+  void close();
+  bool closed() const;
+  bool empty() const;
+  uint64_t itemCount() const;
+  uint64_t currentSize() const;
+  std::optional<uint64_t> maxSize() const;
+  CapacityPtr capacity() const;
 };
-
 ```
